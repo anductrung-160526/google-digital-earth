@@ -44,7 +44,7 @@ except ImportError:
 YEAR = 2024
 START_YEAR, START_MONTH = YEAR, 1
 END_YEAR, END_MONTH = YEAR, 12
-TIME_TAG = str(YEAR)                     # V12.6 dùng "<năm đầu>-<năm cuối>"; một năm thì ghi "2024"
+TIME_TAG = f"{START_YEAR}-{END_YEAR}"    # đúng công thức V12.6, nên một năm 2024 cho "2024-2024"
 
 # ---------------- Tham số trích xuất (giữ nguyên V12.6) ----------------
 PROJECT_ID = "digital-vietnam-earth"
@@ -74,7 +74,9 @@ MAX_ATTEMPTS     = _env("VNGIS_MAX_ATTEMPTS", 3, int)  # số lần thử tối 
 TEST_LIMIT       = _env("VNGIS_TEST_LIMIT", 0, int) or None   # None = chạy tất cả
 PROVINCE_FILTER  = [g for g in _env("VNGIS_PROVINCES", "").split(",") if g]  # ví dụ "VNM.4_1,VNM.27_1"
 OSM_MIN_INTERVAL_SEC = 2.0               # giãn cách giữa hai truy vấn Overpass (dùng chung mọi luồng)
-EE_HIGH_VOLUME   = True                  # endpoint dành cho nhiều request song song
+OSM_REQUEST_TIMEOUT = _env("VNGIS_OSM_TIMEOUT", 60, int)   # giây phía máy chủ Overpass (V12.6: 60); phía client chờ thêm 30 giây (V12.6: 90)
+OSM_BREAKER_STREAK = 5                   # 5 xã liên tiếp lỗi OSM thì tắt OSM cho phần còn lại của lượt
+EE_HIGH_VOLUME   = _env("VNGIS_EE_HIGH_VOLUME", True, bool)   # endpoint cho nhiều request song song (V12.6 dùng endpoint thường)
 EE_DEADLINE_SEC  = 300
 
 # ---------------- Lưu trữ ----------------
@@ -193,7 +195,7 @@ Sinh bởi pipeline V12.6 chạy hàng loạt. Ranh giới: GADM 4.1 cấp xã (
                   Night_VIIRS_Monthly_{YEAR}_ALL.csv
                   Night_DMSP_Annual_{YEAR}_ALL.csv   (rỗng: DMSP chỉ có đến 2012)
                   Night_All_{YEAR}_ALL.csv
-03_Provinces/   <GID_1>_<Tỉnh>/<GID_1>_<Xã>_<GID_3>_{YEAR}/
+03_Provinces/   <GID_1>_<Tỉnh>/<GID_1>_<Xã>_<GID_3>_{TIME_TAG}/
                   Day/{DAY_SOURCE_POLICY}/  ảnh ngày Landsat 8, 10 kênh, 30 m, theo tháng
                   Night/VIIRS/              ảnh đêm VIIRS, 2 kênh (avg_rad, cf_cvg), theo tháng
                   Night/DMSP/               trống với năm {YEAR}
@@ -340,7 +342,19 @@ def resolve_gid(gid_3):
         exact = [x for x in found if re.sub(r"_\d+$", "", x) == base]
         if exact:
             return exact[0], communes_fc.filter(ee.Filter.eq("GID_3", exact[0]))
-    raise ValueError(f"Không tìm thấy mã xã '{gid_3}' trong asset {ASSET_ID}.")
+        raise ValueError(
+            f"Mã '{gid_3}' không khớp xã nào, nhưng có {len(found)} mã bắt đầu "
+            f"bằng '{base}'. Ví dụ: {found[:5]}"
+        )
+
+    parent = ".".join(base.split(".")[:3])  # lùi về cấp huyện để gợi ý
+    sample = (communes_fc.filter(ee.Filter.stringStartsWith("GID_3", parent))
+              .aggregate_array("GID_3").getInfo())
+    raise ValueError(
+        f"Không tìm thấy mã xã '{gid_3}' trong asset {ASSET_ID}.\n"
+        + (f"Các mã thuộc '{parent}' hiện có: {sample[:20]}"
+           if sample else "Chạy cell kế tiếp để xem danh sách mã hợp lệ.")
+    )
 
 
 def get_commune_info(gid_3):
@@ -480,6 +494,8 @@ def download_month_image(gid_3, geom, year, month, out_dir, file_stem, scale=SCA
                 meta = json.load(f)
             return path, meta["sensor"], meta["n_scenes"]
         _, sensor, n_scenes = build_monthly_composite(geom, year, month)
+        if sensor is None:
+            raise RuntimeError(f"Không xác định được nguồn của ảnh cache: {path}")
         with open(sidecar, "w", encoding="utf-8") as f:
             json.dump({"sensor": sensor, "n_scenes": n_scenes}, f)
         return path, sensor, n_scenes
@@ -569,6 +585,8 @@ def download_viirs_month_image(gid_3, geom, year, month, out_dir, file_stem, max
             with open(sidecar, encoding="utf-8") as f:
                 return path, json.load(f)["source_collection"]
         _, collection_id = get_viirs_image(geom, year, month)
+        if collection_id is None:
+            raise RuntimeError(f"Không xác định được collection của ảnh cache: {path}")
         with open(sidecar, "w", encoding="utf-8") as f:
             json.dump({"source_collection": collection_id}, f)
         return path, collection_id
@@ -799,21 +817,21 @@ def _overpass_post(url, query, headers):
         if wait > 0:
             time.sleep(wait)
         _osm_last[0] = time.time()
-    return requests.post(url, data={"data": query}, headers=headers, timeout=90)
+    return requests.post(url, data={"data": query}, headers=headers, timeout=OSM_REQUEST_TIMEOUT + 30)
 
 
 def fetch_osm_road_length(commune):
     poly = shp_shape(commune["geojson"])
     west, south, east, north = poly.bounds
     query = f"""
-[out:json][timeout:60];
+[out:json][timeout:{OSM_REQUEST_TIMEOUT}];
 (
   way["highway"]({south},{west},{north},{east});
 );
 out geom;
 """
     headers = {"User-Agent": "ResearchSpatialEcon/1.0 (contact@research.edu)"}
-    elements = None
+    elements = []
     for url in OVERPASS_MIRRORS:
         try:
             resp = _overpass_post(url, query, headers)
@@ -822,16 +840,17 @@ out geom;
                 break
         except Exception:
             continue
-    if elements is None:
+    if not elements:
+        # Đúng V12.6: Overpass quá tải vẫn trả HTTP 200 với danh sách rỗng, nên rỗng = không có số liệu (NaN),
+        # không được coi là "xã có 0 km đường".
         return {"osm_road_km_total": np.nan, "osm_road_km_main": np.nan, "osm_road_segments": 0}
     lines, types = [], []
     for el in elements:
         if "geometry" in el and len(el["geometry"]) >= 2:
             lines.append(LineString([(p["lon"], p["lat"]) for p in el["geometry"]]))
             types.append(el.get("tags", {}).get("highway", "residential"))
-    if not lines:
-        return {"osm_road_km_total": 0.0, "osm_road_km_main": 0.0, "osm_road_segments": 0}
-    gdf = gpd.GeoDataFrame({"highway": types, "geometry": lines}, crs="EPSG:4326").clip(poly)
+    gdf = gpd.GeoDataFrame({"highway": types, "geometry": lines}, crs="EPSG:4326")
+    gdf = gdf.clip(poly)
     if gdf.empty:
         return {"osm_road_km_total": 0.0, "osm_road_km_main": 0.0, "osm_road_segments": 0}
     utm_epsg = 32600 + int(((west + east) / 2 + 180) / 6) + 1
@@ -842,8 +861,13 @@ out geom;
             "osm_road_segments": int(len(gdf))}
 
 
+_osm_state = {"streak": 0, "disabled": False}
+_osm_state_lock = threading.Lock()
+
+
 def get_osm_cached(commune):
-    """Trả (dict OSM, ok). Chỉ lưu đệm khi tải thành công nên lần thử lại không truy vấn lại."""
+    """Trả (dict OSM, ok). OSM chỉ là dữ liệu tham chiếu nên lỗi OSM KHÔNG làm xã phải chạy lại ảnh vệ tinh.
+    Cầu dao: nhiều xã liên tiếp lỗi (thường do Overpass chặn IP) thì tắt OSM cho phần còn lại của lượt."""
     empty = {"osm_road_km_total": np.nan, "osm_road_km_main": np.nan, "osm_road_segments": np.nan}
     if not FETCH_OSM_REFERENCE:
         return empty, True
@@ -851,12 +875,24 @@ def get_osm_cached(commune):
     if os.path.isfile(cache):
         with open(cache, encoding="utf-8") as f:
             return json.load(f), True
+    if _osm_state["disabled"]:
+        return empty, False
     try:
         osm = fetch_osm_road_length(commune)
+        failed = bool(pd.isna(osm["osm_road_km_total"]))
     except Exception as exc:
         log.warning(f"[{commune['GID_3']}] OSM lỗi: {exc}")
-        return empty, False
-    if pd.isna(osm["osm_road_km_total"]):
+        osm, failed = empty, True
+    with _osm_state_lock:
+        if failed:
+            _osm_state["streak"] += 1
+            if _osm_state["streak"] >= OSM_BREAKER_STREAK and not _osm_state["disabled"]:
+                _osm_state["disabled"] = True
+                log.warning(f"{OSM_BREAKER_STREAK} xã liên tiếp lỗi OSM: Overpass có vẻ chặn máy chạy. "
+                            "Tắt OSM cho phần còn lại của lượt này; các cột osm_* của những xã đó để trống.")
+        else:
+            _osm_state["streak"] = 0
+    if failed:
         return osm, False
     _atomic_json(cache, osm)
     return osm, True
@@ -940,11 +976,15 @@ def _night_row(commune, paths, year, month, sensor, image_path, collection_id=No
 def process_commune(gid):
     _check_stop()
     t0 = time.time()
+    log.info(f"[{gid}] bắt đầu")
     commune = get_commune_info(gid)
     paths = build_commune_paths(commune)
     for key in ("img_dir", "img_dir_dmsp", "img_dir_viirs", "csv_dir"):
         os.makedirs(paths[key], exist_ok=True)
+    t_a = time.time()
     osm, osm_ok = get_osm_cached(commune)
+    sec_osm = round(time.time() - t_a, 1)
+    t_a = time.time()
 
     # ---- Ảnh ngày ----
     day_rows, day_failed = [], 0
@@ -974,6 +1014,8 @@ def process_commune(gid):
             if KEEP_EMPTY_MONTHS:
                 day_rows.append(row)
     day = _write_csv(day_rows, paths["csv_day"], DAY_COLUMNS)
+    sec_day = round(time.time() - t_a, 1)
+    t_a = time.time()
 
     # ---- DMSP theo năm (rỗng với 2024, vẫn ghi CSV để giữ cấu trúc) ----
     dmsp_rows = []
@@ -1009,20 +1051,24 @@ def process_commune(gid):
     viirs = _write_csv(_add_viirs_trends(pd.DataFrame(viirs_rows).reindex(columns=NIGHT_COLUMNS)),
                        paths["csv_viirs"], NIGHT_COLUMNS)
 
-    # ---- Night_All ----
-    frames = [f for f in (dmsp, viirs) if not f.empty]
-    night = (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()).reindex(columns=NIGHT_COLUMNS)
-    if not night.empty:
-        night = night.sort_values(["year", "month", "sensor"], na_position="first").reset_index(drop=True)
-    _write_csv(night, paths["csv_night"], NIGHT_COLUMNS)
+    # ---- Night_All: đúng từng dòng của run_full_pipeline (V12.6) ----
+    # Nối cả bảng DMSP rỗng (năm 2024) như V12.6, nên cột số của Night_All có dạng 2024.0, 500.0 giống bản chuẩn.
+    night = pd.concat([dmsp, viirs], ignore_index=True).reindex(columns=NIGHT_COLUMNS)
+    night = night.sort_values(["year", "month", "sensor"], na_position="first").reset_index(drop=True)
+    night = _write_csv(night, paths["csv_night"], NIGHT_COLUMNS)
+    assert not any(c in day.columns for c in NIGHT_COLUMNS
+                   if c not in ADMIN_COLUMNS + ["date", "year", "month", "sensor", "source_collection", "image_file"])
+    assert night.loc[night.sensor.eq("DMSP-OLS"), "month"].isna().all()
 
+    sec_viirs = round(time.time() - t_a, 1)
     push_commune(paths)          # Colab/path: chép ngay; rclone: luồng nền tự đẩy
-    complete = day_failed == 0 and viirs_failed == 0 and osm_ok
+    complete = day_failed == 0 and viirs_failed == 0     # lỗi OSM chỉ ghi vào osm_ok, không bắt chạy lại ảnh
     return {
         "gid_3": gid, "status": "done" if complete else "partial",
         "name_1": commune["NAME_1"], "name_3": commune["NAME_3"], "rel_dir": paths["rel_dir"],
         "day_rows": len(day), "day_failed": day_failed,
         "viirs_rows": len(viirs), "viirs_failed": viirs_failed, "osm_ok": osm_ok,
+        "sec_osm": sec_osm, "sec_day": sec_day, "sec_viirs": sec_viirs,
         "seconds": round(time.time() - t0, 1),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1288,6 +1334,10 @@ def run_round(todo, statuses, total_targets):
         statuses[gid] = info
         write_status(gid, info)
         done_now += 1
+        log.info(f"[{gid}] {info['status']} sau {info['seconds']:.0f}s "
+                 f"(OSM {info.get('sec_osm', 0):.0f}s, ảnh ngày {info.get('sec_day', 0):.0f}s, "
+                 f"đêm {info.get('sec_viirs', 0):.0f}s) | ngày {info['day_rows']} dòng, VIIRS {info['viirs_rows']} dòng "
+                 f"| osm_ok={info['osm_ok']} | lần {attempts}")
         if done_now % 20 == 0:
             finished = sum(is_finished(statuses.get(g)) for g in statuses)
             rate = done_now / max(time.time() - t0, 1)
