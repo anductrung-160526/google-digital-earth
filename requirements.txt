@@ -1,0 +1,10 @@
+earthengine-api
+geopandas
+rasterio
+pyproj
+shapely
+requests
+pandas
+numpy
+opencv-python-headless
+scikit-image
