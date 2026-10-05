@@ -1,0 +1,161 @@
+name: VNGISDash 2024 (chạy nối lượt)
+
+# Chạy pipeline theo từng lượt khoảng 5 giờ 15 phút. Hết lượt, workflow tự gọi lại chính nó
+# cho đến khi mọi xã xong. Trạng thái nằm trên Google Drive nên lượt sau tiếp tục đúng chỗ dừng.
+#
+# Dừng: tạo file tên STOP ở nhánh mặc định của repo (xem HUONG_DAN_GITHUB_ACTIONS.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_limit:
+        description: "Chạy thử N xã đầu tiên (để trống = chạy tất cả)"
+        required: false
+        default: ""
+      workers:
+        description: "Số xã xử lý song song"
+        required: false
+        default: "8"
+
+# Không bao giờ có hai lượt chạy cùng lúc.
+concurrency:
+  group: vngis-2024
+  cancel-in-progress: false
+
+permissions:
+  actions: write     # để lượt này gọi lượt kế tiếp
+  contents: read     # để kiểm tra file STOP
+
+jobs:
+  gate:
+    name: Kiểm tra file STOP
+    runs-on: ubuntu-latest
+    outputs:
+      stop: ${{ steps.chk.outputs.stop }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: chk
+        run: |
+          if [ -f STOP ]; then
+            echo "stop=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Có file STOP ở repo: không chạy lượt này."
+          else
+            echo "stop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  run:
+    name: Chạy một lượt
+    needs: gate
+    if: needs.gate.outputs.stop != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350              # GitHub hủy job ở 360 phút; chừa 10 phút
+    env:
+      VNGIS_STORAGE_MODE: rclone
+      VNGIS_RCLONE_REMOTE: gdrive
+      VNGIS_DRIVE_FOLDER: VNGISDash_Communes_2024
+      VNGIS_UPLOAD_EVERY_SEC: "300"   # đẩy ảnh lên Drive mỗi 5 phút, giữ ổ runner nhẹ
+      VNGIS_MAX_RUNTIME_SEC: "18900"  # 5 giờ 15 phút; sau đó dừng trật tự và đồng bộ
+      VNGIS_FETCH_OSM: "true"         # đổi thành "false" nếu Overpass chặn IP của GitHub
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cài thư viện
+        run: pip install -r requirements.txt
+
+      - name: Cài rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Ghi khóa truy cập từ Secrets
+        env:
+          RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
+          EE_KEY_DATA: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          [ -n "$RCLONE_CONF_DATA" ] || { echo "::error::Thiếu secret RCLONE_CONF"; exit 1; }
+          [ -n "$EE_KEY_DATA" ] || { echo "::error::Thiếu secret EE_SERVICE_ACCOUNT_JSON"; exit 1; }
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$RCLONE_CONF_DATA" > "$HOME/.config/rclone/rclone.conf"
+          printf '%s' "$EE_KEY_DATA" > "$RUNNER_TEMP/ee-key.json"
+          chmod 600 "$HOME/.config/rclone/rclone.conf" "$RUNNER_TEMP/ee-key.json"
+
+      - name: Chạy pipeline
+        id: pipeline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VNGIS_EE_KEY_FILE: ${{ runner.temp }}/ee-key.json
+          VNGIS_RUN_ID: ${{ github.run_id }}
+          VNGIS_TEST_LIMIT: ${{ inputs.test_limit }}
+          VNGIS_WORKERS: ${{ inputs.workers }}
+          STOP_POLL_SEC: "300"
+        run: |
+          set +e
+          python vngis_2024.py &
+          PID=$!
+          # Cứ 5 phút xem repo có file STOP không; có thì dừng trật tự (đồng bộ rồi thoát).
+          (
+            while kill -0 "$PID" 2>/dev/null; do
+              for _ in $(seq 1 "$STOP_POLL_SEC"); do
+                sleep 1
+                kill -0 "$PID" 2>/dev/null || exit 0
+              done
+              if gh api "repos/${GITHUB_REPOSITORY}/contents/STOP" > /dev/null 2>&1; then
+                echo "::notice::Phát hiện file STOP: dừng trật tự."
+                kill -TERM "$PID" 2>/dev/null
+                exit 0
+              fi
+            done
+          ) &
+          WATCH=$!
+          wait "$PID"
+          code=$?
+          kill "$WATCH" 2>/dev/null
+          wait "$WATCH" 2>/dev/null
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Script thoát với mã $code"
+          exit 0
+
+      - name: Đồng bộ nốt lên Drive (luôn chạy, kể cả khi bị hủy)
+        if: always()
+        continue-on-error: true
+        run: python vngis_2024.py --sync-only
+
+      - name: Tóm tắt tiến độ
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os, pandas as pd
+          p = os.path.expanduser("~/vngis_2024/04_Status/progress.csv")
+          if os.path.isfile(p):
+              d = pd.read_csv(p)
+              print("### Tiến độ VNGISDash 2024\n")
+              print(f"Tổng {len(d):,} xã: {d['status'].value_counts().to_dict()}")
+          PY
+
+      - name: Nối lượt kế tiếp
+        if: steps.pipeline.outputs.code == '3' || steps.pipeline.outputs.code == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_LIMIT: ${{ inputs.test_limit }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/STOP" > /dev/null 2>&1; then
+            echo "::notice::Có file STOP: dừng chuỗi, không nối lượt."
+          else
+            gh workflow run vngis-2024.yml --ref "$GITHUB_REF_NAME" \
+              -f test_limit="$TEST_LIMIT" -f workers="$WORKERS"
+            echo "Đã gọi lượt kế tiếp."
+          fi
+
+      - name: Báo lỗi nếu script thoát bất thường
+        if: >-
+          always() && steps.pipeline.outputs.code != '' &&
+          steps.pipeline.outputs.code != '0' && steps.pipeline.outputs.code != '2' &&
+          steps.pipeline.outputs.code != '3' && steps.pipeline.outputs.code != '130'
+        run: |
+          echo "::error::Script thoát với mã ${{ steps.pipeline.outputs.code }}. Xem log bước 'Chạy pipeline'."
+          exit 1
