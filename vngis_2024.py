@@ -102,7 +102,10 @@ RCLONE_REMOTE = _env("VNGIS_RCLONE_REMOTE", "gdrive")
 REMOTE_BASE = f"{RCLONE_REMOTE}:{DRIVE_FOLDER}"
 LOCAL_ROOT = _env("VNGIS_LOCAL_ROOT", os.path.expanduser(f"~/vngis_2024/{DRIVE_FOLDER}"))
 CACHE_DIR = _env("VNGIS_CACHE_DIR", os.path.expanduser("~/vngis_2024/_cache"))
-UPLOAD_EVERY_SEC = _env("VNGIS_UPLOAD_EVERY_SEC", 300, int)
+UPLOAD_EVERY_SEC = _env("VNGIS_UPLOAD_EVERY_SEC", 60, int)
+MIN_FREE_GB = _env("VNGIS_MIN_FREE_GB", 4.0, float)          # ổ máy chạy còn ít hơn mức này: tạm dừng tải, đẩy lên Drive trước
+RCLONE_TRANSFERS = _env("VNGIS_RCLONE_TRANSFERS", 16, int)
+UPLOAD_NOW = threading.Event()                                # yêu cầu uploader đồng bộ ngay
 DRIVE_STOP_POLL_SEC = 300
 
 D_DAY, D_NIGHT, D_CSV, D_CONTROL = "Day", "Night", "CSV", "_control"
@@ -858,7 +861,27 @@ def _clean(v):
     return v
 
 
+def free_gb():
+    try:
+        return shutil.disk_usage(LOCAL_ROOT).free / 1e9
+    except OSError:
+        return 1e9
+
+
+def wait_for_disk():
+    """Hãm tốc độ: ổ máy chạy sắp đầy thì không tải thêm, yêu cầu đẩy ảnh lên Drive và chờ có chỗ."""
+    warned = False
+    while free_gb() < MIN_FREE_GB:
+        check_stop()
+        UPLOAD_NOW.set()
+        if not warned:
+            log.warning(f"Ổ máy chạy còn {free_gb():.1f} GB (< {MIN_FREE_GB} GB): tạm dừng tải, chờ đẩy ảnh lên Drive.")
+            warned = True
+        time.sleep(5)
+
+
 def _download_month(kind, ctx, m, img, path):
+    wait_for_disk()
     label = f"[{ctx['gid3']}] {kind} {YEAR}-{m:02d}"
     if kind == "day":
         n = download_tif(img, img_region(ctx), 20, path, label,
@@ -1056,6 +1079,41 @@ def load_all_status():
     return out
 
 
+def reconcile_with_drive(statuses, rows):
+    """Xã ghi 'ok' cho một tháng mà ảnh không có trên Drive (ví dụ lượt trước chết khi ảnh chưa kịp đẩy lên):
+    đặt lại tháng đó để làm lại. Liệt kê tên file trên Drive một lần cho cả Day và Night."""
+    names = set()
+    for d in (D_DAY, D_NIGHT):
+        res = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--fast-list", "--include", "*.tif",
+                              f"{REMOTE_BASE}/{d}"], capture_output=True, text=True, timeout=3600)
+        if res.returncode != 0 and "directory not found" not in res.stderr:
+            raise RuntimeError(f"Không liệt kê được {d} trên Drive: {res.stderr.strip()[-300:]}")
+        names.update(os.path.basename(x.strip()) for x in res.stdout.splitlines() if x.strip())
+    fixed = 0
+    for gid, st in list(statuses.items()):
+        if gid not in rows or not st:
+            continue
+        ctx = build_ctx(rows[gid])
+        missing = []
+        for key_slot, namer, tag in (("t2", day_name, "day"), ("t3img", night_name, "night")):
+            slot = dict(st.get(key_slot) or {})
+            for key, v in slot.items():
+                if v == "ok" and namer(ctx, int(key)) not in names and not os.path.isfile(
+                        L(ctx["rel_day_dir" if tag == "day" else "rel_night_dir"], namer(ctx, int(key)))):
+                    slot[key] = "missing"
+                    missing.append(f"{tag} {key}")
+            st[key_slot] = slot
+        if missing:
+            st["status"] = "partial"
+            st["attempts"] = min(int(st.get("attempts", 0)), MAX_ATTEMPTS - 1)
+            st["errors"] = [f"Thiếu trên Drive, làm lại: {', '.join(missing)}"]
+            st["run_id"] = RUN_ID
+            write_status(st)
+            fixed += 1
+    log.info(f"Đối chiếu Drive: {len(names):,} ảnh có trên Drive; {fixed:,} xã thiếu ảnh được đặt làm lại.")
+    return fixed
+
+
 def core_finished(st):
     return bool(st) and (st.get("status") == "done" or st.get("status") == "not_in_asset"
                          or int(st.get("attempts", 0)) >= MAX_ATTEMPTS)
@@ -1065,7 +1123,7 @@ def core_finished(st):
 # =====================================================================================
 # 9. RCLONE
 # =====================================================================================
-RCLONE_COMMON = ["--transfers", "4", "--checkers", "8", "--tpslimit", "8",
+RCLONE_COMMON = ["--transfers", str(RCLONE_TRANSFERS), "--checkers", "16", "--tpslimit", "12",
                  "--retries", "5", "--low-level-retries", "20", "--stats-log-level", "NOTICE"]
 
 
@@ -1089,7 +1147,7 @@ def rclone_sync_once(final=False):
     if not os.path.isdir(LOCAL_ROOT):
         return
     with _sync_lock:
-        age = [] if final else ["--min-age", "2m"]
+        age = [] if final else ["--min-age", "30s"]
         for d in (D_DAY, D_NIGHT):
             src = L(d)
             if os.path.isdir(src):
@@ -1108,13 +1166,14 @@ class Uploader(threading.Thread):
 
     def run(self):
         last_stop_check = 0
-        while not self.stop_event.wait(min(UPLOAD_EVERY_SEC, 60)):
+        while not self.stop_event.wait(5):
             now = time.time()
             if now - last_stop_check >= DRIVE_STOP_POLL_SEC:
                 last_stop_check = now
                 if drive_stop_exists():
                     request_stop("drive_stop")
-            if now - getattr(self, "_last_sync", 0) >= UPLOAD_EVERY_SEC:
+            if UPLOAD_NOW.is_set() or now - getattr(self, "_last_sync", 0) >= UPLOAD_EVERY_SEC:
+                UPLOAD_NOW.clear()
                 self._last_sync = now
                 try:
                     rclone_sync_once()
@@ -1450,6 +1509,13 @@ def main():
              + (f" (thí điểm: {', '.join(gids)})" if MODE == "pilot" else ""))
 
     statuses = load_all_status()
+    try:
+        if statuses:
+            reconcile_with_drive(statuses, rows)
+            statuses = load_all_status()
+    except Exception as exc:
+        log.error(f"Đối chiếu ảnh trên Drive thất bại: {exc}. Dừng để không bỏ sót xã thiếu ảnh.")
+        return 1
     if PREFLIGHT:
         pend = [g for g in gids if not core_finished(statuses.get(g))] or gids
         for attempt in (1, 2, 3):
