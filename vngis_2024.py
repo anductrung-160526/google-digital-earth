@@ -64,9 +64,14 @@ if PILOT_N < 1:
 # Ảnh ngày: số kênh lưu vào tif. 6 = BLUE..SWIR2 (NDVI, NDBI, MNDWI, BSI tính lại được từ 6 kênh này);
 # 10 = đủ 10 kênh như notebook (file lớn gần gấp đôi).
 DAY_BANDS_ALL = ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2", "NDVI", "NDBI", "MNDWI", "BSI"]
-DAY_BANDS = _env("VNGIS_DAY_BANDS", 6, int)
+DAY_BANDS = _env("VNGIS_DAY_BANDS", 10, int)
 if DAY_BANDS not in (6, 10):
     raise SystemExit("VNGIS_DAY_BANDS phải là 6 hoặc 10")
+# Kiểu lưu ảnh ngày: float = giữ nguyên giá trị Earth Engine trả về, nén DEFLATE không mất dữ liệu (như bản 4);
+# int16 = số nguyên round(giá trị × VNGIS_DAY_SCALE), file nhỏ hơn ~3-4 lần nhưng nhiều trình xem không mở được.
+DAY_FORMAT = _env("VNGIS_DAY_FORMAT", "float").lower()
+if DAY_FORMAT not in ("float", "int16"):
+    raise SystemExit("VNGIS_DAY_FORMAT phải là float hoặc int16")
 DAY_SCALE_INV = _env("VNGIS_DAY_SCALE", 10000, int)  # int16 = round(giá trị × 10000); 1000 cho file nhỏ hơn ~40%
 if DAY_SCALE_INV not in (1000, 10000):
     raise SystemExit("VNGIS_DAY_SCALE phải là 10000 hoặc 1000")
@@ -697,7 +702,7 @@ def _best_compression():
             with rasterio.MemoryFile() as mf, mf.open(driver="GTiff", width=8, height=8, count=1, dtype="int16",
                                                       compress="ZSTD", zstd_level=19) as d:
                 d.write(np.zeros((1, 8, 8), "int16"))
-            _COMP.append({"compress": "ZSTD", "zstd_level": 19})
+            _COMP.append({"compress": "DEFLATE", "zlevel": 9})   # DEFLATE: mọi phần mềm GIS đọc được
         except Exception:
             _COMP.append({"compress": "DEFLATE", "zlevel": 9})
     return _COMP[0]
@@ -856,7 +861,8 @@ def _clean(v):
 def _download_month(kind, ctx, m, img, path):
     label = f"[{ctx['gid3']}] {kind} {YEAR}-{m:02d}"
     if kind == "day":
-        n = download_tif(img, img_region(ctx), 20, path, label, writer=write_day_int16)
+        n = download_tif(img, img_region(ctx), 20, path, label,
+                         writer=write_day_int16 if DAY_FORMAT == "int16" else write_tif)
         ok, empty, note = inspect_tif(path, DAY_BANDS)
     else:
         n = download_tif(img, img_region(ctx), 500, path, label, writer=write_tif)
@@ -1424,7 +1430,7 @@ def main():
     STATUS_FILE = L(D_STATUS, f"status_{PARTS_STAMP}.jsonl")
     setup_logging()
     log.info(f"VNGISDash {YEAR} | chế độ {MODE} | đích {REMOTE_BASE} | {N_WORKERS} xã x {MONTH_THREADS} ảnh song song"
-             f" | ảnh ngày {DAY_BANDS} kênh int16")
+             f" | ảnh ngày {DAY_BANDS} kênh {DAY_FORMAT}")
     try:
         # Khởi tạo Earth Engine song song với việc kéo trạng thái từ Drive
         with ThreadPoolExecutor(max_workers=2) as ex:
