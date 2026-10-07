@@ -65,13 +65,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
-      VNGIS_UPLOAD_EVERY_SEC: "300"
+      VNGIS_UPLOAD_EVERY_SEC: "60"
       VNGIS_MAX_RUNTIME_SEC: "18900"
       VNGIS_EE_HIGH_VOLUME: "false"
-      VNGIS_DAY_BANDS: "6"            # 6 = BLUE..SWIR2 | 10 = thêm NDVI, NDBI, MNDWI, BSI (file lớn gần gấp đôi)
-      VNGIS_DAY_SCALE: "10000"        # 10000: sai số 0,00005 | 1000: file nhỏ thêm ~40%, sai số 0,0005
+      # Dung lượng ảnh ngày (xem HUONG_DAN.md mục "Dung lượng ảnh ngày")
+      VNGIS_DAY_FORMAT: "int16"       # int16 = nhỏ hơn ~3-4 lần, sai số 0,00005 | float = như bản 4
+      VNGIS_DAY_BANDS: "10"           # 10 = đủ như notebook | 6 = chỉ BLUE..SWIR2, nhỏ hơn ~40%
+      VNGIS_DAY_SCALE: "10000"        # chỉ dùng khi int16: 10000 (sai số 0,00005) | 1000 (nhỏ thêm ~40%)
     steps:
       - uses: actions/checkout@v4
+
+      # Máy GitHub chỉ trống ~14 GB; xóa các bộ công cụ cài sẵn không dùng để có thêm ~20-30 GB
+      - name: Dọn ổ máy chạy
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
 
       - uses: actions/setup-python@v5
         id: py
