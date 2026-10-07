@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
-# Sinh tự động từ V12_6_batch_2024_all_communes.ipynb. Chạy: python vngis_2024.py
+"""
+VNGISDash 2024: pipeline tự động cấp xã chạy trên GitHub Actions.
 
-import importlib, importlib.util, subprocess, sys
+Nguồn khoa học: VNGISDash_Task123_Merged_final.ipynb. Pipeline chỉ giữ 3 chức năng:
+  (1) trích xuất chỉ số từ ảnh ngày (Task 1) và ảnh đêm (Task 3.2), (2) lấy ảnh tif ngày (Task 2),
+  (3) lấy ảnh tif đêm (Task 3.1). Không có bước chọn tỉnh, xã: VNGIS_MODE=pilot tự lấy 2 xã,
+  VNGIS_MODE=full chạy mọi xã.
+Mọi hàm Earth Engine và công thức được chép nguyên văn từ notebook (xem DOI_CHIEU_NOTEBOOK.md).
+Phần viết mới chỉ là "vỏ": duyệt danh sách xã, tải ảnh bằng getDownloadURL, ghi file, đồng bộ Drive,
+ghi trạng thái, chạy nối lượt.
 
-_REQUIRED = {  # tên module: tên gói pip
-    "ee": "earthengine-api", "geopandas": "geopandas", "rasterio": "rasterio",
-    "pyproj": "pyproj", "shapely": "shapely", "requests": "requests",
-    "cv2": "opencv-python-headless", "skimage": "scikit-image",
-    "pandas": "pandas", "numpy": "numpy",
-}
-_missing = [pkg for mod, pkg in _REQUIRED.items() if importlib.util.find_spec(mod) is None]
-if _missing:
-    print("[*] Cài thêm:", " ".join(_missing))
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *_missing])
-print("[+] Thư viện sẵn sàng.")
+Chạy:
+    python vngis_2024.py               chạy pipeline
+    python vngis_2024.py --sync-only   đẩy nốt dữ liệu trên máy lên Drive
+    python vngis_2024.py --merge-only  gộp CSV toàn quốc từ dữ liệu trên Drive
 
-import os, io, re, json, time, math, shutil, zipfile, logging, threading, unicodedata, warnings, glob
-from datetime import datetime, timezone, timedelta
+Mã thoát: 0 xong toàn bộ | 1 lỗi cấu hình hoặc preflight | 2 sự cố EE kéo dài | 3 hết giờ (nối lượt) | 130 dừng tay
+"""
+
+import os, io, re, sys, json, time, glob, math, shutil, zipfile, signal, logging, calendar
+import threading, subprocess, unicodedata, warnings
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
 import requests
@@ -27,217 +32,97 @@ warnings.filterwarnings("ignore")
 
 def _env(name, default, cast=str):
     raw = os.environ.get(name)
-    if raw is None or raw == "":
+    if raw is None or raw.strip() == "":
         return default
     if cast is bool:
         return raw.strip().lower() in ("1", "true", "yes", "y")
-    return cast(raw)
+    return cast(raw.strip())
 
 
-try:
-    import google.colab  # noqa: F401
-    IN_COLAB = True
-except ImportError:
-    IN_COLAB = False
-
-# ---------------- Khung thời gian ----------------
+# =====================================================================================
+# 1. CẤU HÌNH
+# =====================================================================================
 YEAR = 2024
-START_YEAR, START_MONTH = YEAR, 1
-END_YEAR, END_MONTH = YEAR, 12
-TIME_TAG = str(YEAR)                     # V12.6 dùng "<năm đầu>-<năm cuối>"; một năm thì ghi "2024"
+MONTHS = list(range(1, 13))
+TIME_START_STR, TIME_END_STR = f"{YEAR}01", f"{YEAR}12"          # "202401", "202412" như notebook
 
-# ---------------- Tham số trích xuất (giữ nguyên V12.6) ----------------
-PROJECT_ID = "digital-vietnam-earth"
-ASSET_ID   = f"projects/{PROJECT_ID}/assets/communes_l3"
-SCALE      = 30                          # Landsat 30 m/pixel
-SCALE_FALLBACK = 60                      # hạ xuống 60 m nếu ảnh 30 m vượt hạn mức tải
-MAX_CLOUD  = 70                          # % mây tối đa của 1 scene
-DAY_SOURCE_POLICY = "YEAR_BLOCKS_L5_L7_L8"
-FETCH_OSM_REFERENCE = _env("VNGIS_FETCH_OSM", True, bool)   # False nếu Overpass chặn IP máy chạy
-OVERWRITE  = False
-KEEP_EMPTY_MONTHS = False
-VIIRS_FIRST_DATE    = (2012, 4)
-DMSP_LAST_YEAR      = 2012
-VIIRS_LIT_THRESHOLD = 1.5
-DMSP_LIT_THRESHOLD  = 5
-VIIRS_SCALE         = 500
-DMSP_SCALE          = 927
-BAND_ORDER = ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2",
-              "NDVI", "NDBI", "MNDWI", "BSI"]
+PROJECT_ID = "digital-vietnam-earth"                               # notebook cell 11
+ASSET_ID = f"projects/{PROJECT_ID}/assets/communes_l3"             # notebook cell 11
 
-# ---------------- Chạy hàng loạt ----------------
-N_WORKERS        = _env("VNGIS_WORKERS", 8, int)       # số xã xử lý song song
-RUN_ID           = _env("VNGIS_RUN_ID", "local")       # GitHub Actions truyền github.run_id vào đây
-MAX_RUNTIME_SEC  = _env("VNGIS_MAX_RUNTIME_SEC", 0, int)  # >0: hết ngân sách giờ thì dừng có trật tự (mã thoát 3)
-EE_KEY_FILE      = _env("VNGIS_EE_KEY_FILE", "")       # đường dẫn khóa JSON của service account (chạy không cần người)
-MAX_ATTEMPTS     = _env("VNGIS_MAX_ATTEMPTS", 3, int)  # số lần thử tối đa cho mỗi xã
-TEST_LIMIT       = _env("VNGIS_TEST_LIMIT", 0, int) or None   # None = chạy tất cả
-PROVINCE_FILTER  = [g for g in _env("VNGIS_PROVINCES", "").split(",") if g]  # ví dụ "VNM.4_1,VNM.27_1"
-OSM_MIN_INTERVAL_SEC = 2.0               # giãn cách giữa hai truy vấn Overpass (dùng chung mọi luồng)
-EE_HIGH_VOLUME   = True                  # endpoint dành cho nhiều request song song
-EE_DEADLINE_SEC  = 300
+N_WORKERS = _env("VNGIS_WORKERS", 8, int)
+RUN_ID = _env("VNGIS_RUN_ID", "local")
+MAX_RUNTIME_SEC = _env("VNGIS_MAX_RUNTIME_SEC", 0, int)
+EE_KEY_FILE = _env("VNGIS_EE_KEY_FILE", "")
+EE_HIGH_VOLUME = _env("VNGIS_EE_HIGH_VOLUME", False, bool)        # mặc định endpoint standard
+MAX_ATTEMPTS = _env("VNGIS_MAX_ATTEMPTS", 3, int)
+MODE = _env("VNGIS_MODE", "pilot").lower()                        # pilot: tự lấy 2 xã | full: toàn bộ xã
+if MODE not in ("pilot", "full"):
+    raise SystemExit(f"VNGIS_MODE phải là 'pilot' hoặc 'full', đang là '{MODE}'")
+PILOT_N = _env("VNGIS_PILOT_N", 2, int)                            # số xã thí điểm, tùy chọn
+if PILOT_N < 1:
+    raise SystemExit("VNGIS_PILOT_N phải >= 1")
+PREFLIGHT = _env("VNGIS_PREFLIGHT", True, bool)
+COMPRESS_TIF = _env("VNGIS_COMPRESS_TIF", True, bool)             # nén DEFLATE không mất dữ liệu
+EE_DEADLINE_SEC = 300
+DOWNLOAD_FAIL_LIMIT = 24          # 24 lượt tải liên tiếp thất bại, chưa thành công lần nào: dừng job
+MAX_TILE_SPLIT = 8                # chia tối đa 8x8 ô khi ảnh vượt hạn mức tải
+TILING_OK = [True]                # preflight kiểm tra chia ô; nếu không đạt, xã cần chia ô sẽ báo lỗi rõ ràng
 
-# ---------------- Lưu trữ ----------------
-DRIVE_FOLDER_NAME = _env("VNGIS_DRIVE_FOLDER", "VNGISDash_Communes_2024")
-STORAGE_MODE  = _env("VNGIS_STORAGE_MODE", "colab" if IN_COLAB else "rclone")  # colab | rclone | path
-RCLONE_REMOTE = _env("VNGIS_RCLONE_REMOTE", "gdrive")   # tên remote đã tạo bằng `rclone config`
-SYNC_PATH     = _env("VNGIS_SYNC_PATH", "")             # chế độ path: thư mục đích có sẵn trên máy
-LOCAL_ROOT    = _env("VNGIS_LOCAL_ROOT",
-                     "/content/vngis_2024" if IN_COLAB else os.path.expanduser("~/vngis_2024"))
-UPLOAD_EVERY_SEC    = _env("VNGIS_UPLOAD_EVERY_SEC", 600, int)  # chế độ rclone: đẩy lên Drive mỗi 10 phút
-UPLOAD_SIDECAR_JSON = _env("VNGIS_UPLOAD_JSON", False, bool)    # .json chỉ phục vụ cache, mặc định không đẩy
-KEEP_LOCAL_TIF      = _env("VNGIS_KEEP_LOCAL_TIF", False, bool) # False = xóa TIF trên máy sau khi đã lên Drive
+DRIVE_FOLDER = _env("VNGIS_DRIVE_FOLDER", "VNGISDash_PILOT_2024" if MODE == "pilot" else "VNGISDash_Communes_2024")
+RCLONE_REMOTE = _env("VNGIS_RCLONE_REMOTE", "gdrive")
+REMOTE_BASE = f"{RCLONE_REMOTE}:{DRIVE_FOLDER}"
+LOCAL_ROOT = _env("VNGIS_LOCAL_ROOT", os.path.expanduser(f"~/vngis_2024/{DRIVE_FOLDER}"))
+CACHE_DIR = _env("VNGIS_CACHE_DIR", os.path.expanduser("~/vngis_2024/_cache"))
+UPLOAD_EVERY_SEC = _env("VNGIS_UPLOAD_EVERY_SEC", 300, int)
+DRIVE_STOP_POLL_SEC = 300
 
-# ---------------- Cấu trúc thư mục trên Drive ----------------
-SUB_README   = "00_README.txt"
-SUB_INDEX    = "01_Index"       # danh mục xã + trạng thái
-SUB_COMBINED = "02_Combined"    # CSV gộp toàn quốc
-SUB_PROV     = "03_Provinces"   # dữ liệu từng xã, nhóm theo tỉnh
-SUB_STATUS   = "04_Status"      # trạng thái từng xã, phục vụ chạy tiếp
-SUB_LOGS     = "05_Logs"
+# Cấu trúc thư mục (giống hệt trên Drive)
+D_CONTROL = "_control"
+D_STATUS = f"{D_CONTROL}/status"
+D_LOGS = f"{D_CONTROL}/logs"
+D_T1 = "1_Task1_Spectral_Indices"
+D_T2 = "2_Task2_Day_S2"
+D_T3IMG = "3_Task3_Night_VIIRS"
+D_T3CSV = "4_Task3_Economic_Indices"
+D_MERGED = "_merged"
 
-if STORAGE_MODE == "colab":
-    DEST_BASE = f"/content/drive/MyDrive/{DRIVE_FOLDER_NAME}"
-elif STORAGE_MODE == "path":
-    if not SYNC_PATH:
-        raise ValueError("Chế độ path cần VNGIS_SYNC_PATH.")
-    DEST_BASE = os.path.join(SYNC_PATH, DRIVE_FOLDER_NAME)
-elif STORAGE_MODE == "rclone":
-    DEST_BASE = None                     # đích là rclone remote, xem ô đồng bộ
-else:
-    raise ValueError(f"STORAGE_MODE không hợp lệ: {STORAGE_MODE}")
-
-# META_ROOT chứa index, trạng thái, log, CSV gộp. Ở Colab/path nằm thẳng trên đích
-# để phiên mới đọc lại được; ở máy ảo nằm trên ổ cục bộ rồi được rclone đẩy lên.
-META_ROOT = DEST_BASE if DEST_BASE else LOCAL_ROOT
-WORK_PROV_ROOT = os.path.join(LOCAL_ROOT, SUB_PROV)   # nơi tải và xử lý ảnh
-# Trạng thái ghi theo "lượt chạy": mỗi lượt một file .jsonl, nối thêm một dòng cho mỗi xã xong.
-# Một lượt = một lần chạy script (một phiên Colab, một lượt GitHub Actions...). Nhờ vậy 11 nghìn xã
-# chỉ cần kéo về vài file nhỏ, không phải 11 nghìn file riêng lẻ từ Drive.
-LEASE_DIR = os.path.join(META_ROOT, SUB_STATUS, "leases")
-LEASE_FILE = os.path.join(LEASE_DIR, f"lease_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{RUN_ID}.jsonl")
-# Bộ nhớ đệm OSM: ở chế độ rclone chỉ giữ trên máy (xã đã xong không cần lại).
-OSM_CACHE_DIR = (os.path.join(LOCAL_ROOT, "osm_cache") if STORAGE_MODE == "rclone"
-                 else os.path.join(META_ROOT, SUB_STATUS, "osm_cache"))
-
-
-def _in_notebook():
-    return "ipykernel" in sys.modules
-LOG_DIR = os.path.join(META_ROOT, SUB_LOGS)
-
-DATA_DIR    = os.path.join(LOCAL_ROOT, "data_spatial")
-ZIP_PATH    = os.path.join(DATA_DIR, "gadm41_VNM_shp.zip")
-EXTRACT_DIR = os.path.join(DATA_DIR, "gadm41_VNM")
-SHP_L3_PATH = os.path.join(EXTRACT_DIR, "gadm41_VNM_3.shp")
-INDEX_CSV   = os.path.join(DATA_DIR, "commune_index.csv")
-GADM_VNM_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_VNM_shp.zip"
-ADM_COLS = ["GID_1", "NAME_1", "GID_2", "NAME_2", "GID_3", "NAME_3", "TYPE_3"]
-
-print(f"[+] Môi trường: {'Colab' if IN_COLAB else 'máy chủ'} | lưu trữ: {STORAGE_MODE} | "
-      f"luồng: {N_WORKERS} | giới hạn thử: {TEST_LIMIT}")
-
-def slugify_vn(text):
-    """Bỏ dấu tiếng Việt và viết hoa đầu mỗi chữ (giữ nguyên V12.6)."""
-    if text is None:
-        return "NA"
-    text = str(text).replace("Đ", "D").replace("đ", "d")
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    parts = re.findall(r"[A-Za-z0-9]+", text)
-    return "".join(p.capitalize() for p in parts) or "NA"
-
-
-def province_folder(commune):
-    return f"{commune['GID_1']}_{slugify_vn(commune['NAME_1'])}"
-
-
-def build_commune_paths(commune, prov_root=None, time_tag=TIME_TAG):
-    """Như V12.6, thêm một cấp thư mục tỉnh để 11 nghìn xã không dồn vào một chỗ."""
-    prov_root = prov_root or WORK_PROV_ROOT
-    prov_code = commune["GID_1"]
-    prov_name = slugify_vn(commune["NAME_1"])
-    ward_name = slugify_vn(f"{commune.get('TYPE_3', '')} {commune['NAME_3']}".strip())
-    gid_3 = commune["GID_3"]
-
-    dir_name = f"{prov_code}_{ward_name}_{gid_3}_{time_tag}"
-    prov_dir = province_folder(commune)
-    rel_dir = os.path.join(SUB_PROV, prov_dir, dir_name)
-    commune_dir = os.path.join(prov_root, prov_dir, dir_name)
-    file_stem = f"{prov_name}_{ward_name}_{gid_3}"
-    return {
-        "dir_name": dir_name, "prov_dir": prov_dir, "rel_dir": rel_dir,
-        "commune_dir": commune_dir,
-        "img_dir": os.path.join(commune_dir, "Day", DAY_SOURCE_POLICY),
-        "img_dir_dmsp": os.path.join(commune_dir, "Night", "DMSP"),
-        "img_dir_viirs": os.path.join(commune_dir, "Night", "VIIRS"),
-        "csv_dir": os.path.join(commune_dir, "CSV"),
-        "csv_day": os.path.join(commune_dir, "CSV", f"{file_stem}_Day_Monthly_{DAY_SOURCE_POLICY}.csv"),
-        "csv_dmsp": os.path.join(commune_dir, "CSV", f"{file_stem}_Night_DMSP_Annual.csv"),
-        "csv_viirs": os.path.join(commune_dir, "CSV", f"{file_stem}_Night_VIIRS_Monthly.csv"),
-        "csv_night": os.path.join(commune_dir, "CSV", f"{file_stem}_Night_All.csv"),
-        "file_stem": file_stem,
-    }
-
-
-def make_image_name(file_stem, year, month, kind):
-    return f"{file_stem}_{year}{month:02d}_{kind}.tif"
-
-
-README_TEXT = f"""VNGISDash - Dữ liệu vệ tinh cấp xã Việt Nam, năm {YEAR}
-Sinh bởi pipeline V12.6 chạy hàng loạt. Ranh giới: GADM 4.1 cấp xã (trước sắp xếp 01/7/2025).
-
-00_README.txt   Tệp này.
-01_Index/       commune_index_{YEAR}.csv: mọi xã, thư mục tương ứng và trạng thái xử lý.
-02_Combined/    CSV gộp toàn quốc, mỗi dòng có gid_3 để lọc:
-                  Day_Monthly_{DAY_SOURCE_POLICY}_{YEAR}_ALL.csv
-                  Night_VIIRS_Monthly_{YEAR}_ALL.csv
-                  Night_DMSP_Annual_{YEAR}_ALL.csv   (rỗng: DMSP chỉ có đến 2012)
-                  Night_All_{YEAR}_ALL.csv
-03_Provinces/   <GID_1>_<Tỉnh>/<GID_1>_<Xã>_<GID_3>_{YEAR}/
-                  Day/{DAY_SOURCE_POLICY}/  ảnh ngày Landsat 8, 10 kênh, 30 m, theo tháng
-                  Night/VIIRS/              ảnh đêm VIIRS, 2 kênh (avg_rad, cf_cvg), theo tháng
-                  Night/DMSP/               trống với năm {YEAR}
-                  CSV/                      4 CSV của xã, cùng định dạng V12.6
-04_Status/      Trạng thái từng xã (dùng để chạy tiếp), progress.csv tổng hợp.
-05_Logs/        Nhật ký chạy.
-
-Tháng không có ảnh Landsat đạt ngưỡng mây {MAX_CLOUD}% sẽ không có dòng trong CSV ảnh ngày.
-"""
-print("[+] Ví dụ thư mục xã:",
-      build_commune_paths({"GID_1": "VNM.27_1", "NAME_1": "Hà Nội", "TYPE_3": "Phường",
-                           "NAME_3": "Thành Công", "GID_3": "VNM.27.3.1_1"})["rel_dir"])
+GADM_VNM_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_VNM_shp.zip"   # notebook cell 3
+ADM_COLS = ["GID_1", "NAME_1", "GID_2", "NAME_2", "GID_3", "NAME_3", "TYPE_3"]     # notebook cell 3
 
 log = logging.getLogger("vngis")
 
 
-# ============ DỪNG CÓ TRẬT TỰ ============
+def L(*parts):
+    return os.path.join(LOCAL_ROOT, *parts)
+
+
+# =====================================================================================
+# 2. DỪNG CÓ TRẬT TỰ, LOG
+# =====================================================================================
 class StopRequested(BaseException):
-    """Báo hiệu dừng có trật tự (hết ngân sách giờ hoặc nhận tín hiệu).
-    Kế thừa BaseException để các khối `except Exception` của xã không nuốt mất."""
+    """Kế thừa BaseException để khối `except Exception` của từng xã không nuốt mất."""
 
 
 STOP_EVENT = threading.Event()
-STOP_REASON = [None]            # "deadline" hoặc "signal"
+STOP_REASON = [None]
 
 
 def request_stop(reason):
     if not STOP_EVENT.is_set():
         STOP_REASON[0] = reason
         STOP_EVENT.set()
-        why = "hết ngân sách thời gian của lượt này" if reason == "deadline" else "nhận tín hiệu dừng"
-        log.warning(f"Dừng có trật tự ({why}): hoàn tất bước đang chạy, đồng bộ rồi thoát.")
+        why = {"deadline": "hết thời gian của lượt", "fatal": "lỗi tải ảnh nghiêm trọng",
+               "drive_stop": "có file STOP trên Drive"}.get(reason, "nhận tín hiệu dừng")
+        log.warning(f"Dừng có trật tự ({why}): làm nốt bước đang chạy, đồng bộ rồi thoát.")
 
 
-def _check_stop():
+def check_stop():
     if STOP_EVENT.is_set():
         raise StopRequested()
 
 
 def install_signal_handlers():
-    """Ctrl+C hoặc SIGTERM = dừng có trật tự; tín hiệu lần hai = thoát ngay."""
-    import signal
-
-    def handler(signum, _frame):
+    def handler(_s, _f):
         if STOP_EVENT.is_set():
             os._exit(130)
         request_stop("signal")
@@ -246,814 +131,869 @@ def install_signal_handlers():
 
 
 def setup_logging():
-    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(L(D_LOGS), exist_ok=True)
     log.setLevel(logging.INFO)
     log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s %(levelname).1s [%(threadName)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-    sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt); log.addHandler(sh)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fh = logging.FileHandler(os.path.join(LOG_DIR, f"run_{stamp}.log"), encoding="utf-8")
-    fh.setFormatter(fmt); log.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    fh = logging.FileHandler(L(D_LOGS, f"run_{stamp}_{RUN_ID}.log"), encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
     log.propagate = False
 
 
+def _nb_print(*args, **_kw):
+    """Các hàm chép từ notebook gọi print(); ở pipeline chuyển thành log mức DEBUG cho gọn."""
+    log.debug(" ".join(str(a) for a in args))
+
+
+# =====================================================================================
+# 3. CHUẨN HÓA TÊN (2 bản khác nhau, đúng như notebook)
+# =====================================================================================
+def normalize_str_t1(s):
+    """Bản của Task 1 (notebook cell 15): bỏ ký tự đặc biệt, không thêm '_'."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFD", str(s))
+    s = re.sub(r"[̀-ͯ]", "", s)
+    s = s.replace("đ", "d").replace("Đ", "d")
+    return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
+
+
+def normalize_str(s):
+    """Bản của Task 2/3 (notebook cell 17)."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFD", str(s))
+    s = re.sub(r"[̀-ͯ]", "", s)
+    s = s.replace("đ", "d").replace("Đ", "d")
+    s = re.sub(r"[^a-zA-Z0-9]+", "_", s)
+    return s.strip("_").lower()
+
+
+def commune_full_name(row):
+    """Tên xã kèm loại đơn vị, đúng build_commune_map (notebook cell 13)."""
+    c_type = str(row.get("TYPE_3", "")).strip()
+    c_name = str(row["NAME_3"]).strip()
+    return f"{c_type} {c_name}" if c_type and c_type.lower() != "nan" else c_name
+
+
+def build_ctx(row):
+    """Biến của một xã, đặt tên giống các biến matched_* trong notebook."""
+    row = dict(row)
+    gid1, gid3 = str(row["GID_1"]), str(row["GID_3"])
+    name1 = str(row["NAME_1"])
+    cname_full = commune_full_name(row)
+    clean_pname = normalize_str(name1)
+    clean_cname = normalize_str(cname_full)
+    safe_gid3 = gid3.replace(".", "_")
+    prov_dir = f"{gid1}_{clean_pname}"
+    t2_folder = f"S2_Day_{clean_pname}_{clean_cname}_{safe_gid3}_{TIME_START_STR}-{TIME_END_STR}"
+    t3_folder = f"VIIRS_Night_{clean_pname}_{clean_cname}_{safe_gid3}_{TIME_START_STR}-{TIME_END_STR}"
+    t1_name = f"s2_{normalize_str_t1(name1)}_{gid1}_{gid3.replace('.', '_')}_{YEAR}_Spectral_Indices.csv"
+    t3_csv = f"VIIRS_Night_{clean_pname}_{clean_cname}_{safe_gid3}_{TIME_START_STR}-{TIME_END_STR}_Economic_Indices.csv"
+    return {
+        "row": row, "gid1": gid1, "gid3": gid3, "name1": name1, "cname_full": cname_full,
+        "clean_pname": clean_pname, "clean_cname": clean_cname, "safe_gid3": safe_gid3,
+        "rel_t1": f"{D_T1}/{prov_dir}/{t1_name}",
+        "rel_t2_dir": f"{D_T2}/{prov_dir}/{t2_folder}",
+        "rel_t3_dir": f"{D_T3IMG}/{prov_dir}/{t3_folder}",
+        "rel_t3csv": f"{D_T3CSV}/{prov_dir}/{t3_csv}",
+    }
+
+
+def t2_name(ctx, y, m):
+    return f"S2_Day_{ctx['clean_pname']}_{ctx['clean_cname']}_{ctx['safe_gid3']}_{y}{m:02d}.tif"
+
+
+def t3_name(ctx, y, m):
+    return f"VIIRS_Night_{ctx['clean_pname']}_{ctx['clean_cname']}_{ctx['safe_gid3']}_{y}{m:02d}.tif"
+
+
+# =====================================================================================
+# 4. EARTH ENGINE
+# =====================================================================================
 import ee
+
 communes_fc = None
+EE_CREDENTIALS = None
 
 
 def init_earth_engine():
-    global communes_fc
+    global communes_fc, EE_CREDENTIALS
     kwargs = {"project": PROJECT_ID}
     if EE_HIGH_VOLUME:
         kwargs["opt_url"] = "https://earthengine-highvolume.googleapis.com"
     if EE_KEY_FILE:
-        # Chạy tự động: xác thực bằng service account, không cần người bấm.
         with open(EE_KEY_FILE, encoding="utf-8") as f:
             email = json.load(f)["client_email"]
-        ee.Initialize(credentials=ee.ServiceAccountCredentials(email, EE_KEY_FILE), **kwargs)
-        log.info(f"Earth Engine sẵn sàng bằng service account {email}.")
+        EE_CREDENTIALS = ee.ServiceAccountCredentials(email, EE_KEY_FILE)
+        ee.Initialize(credentials=EE_CREDENTIALS, **kwargs)
+        log.info(f"Earth Engine sẵn sàng: service account {email}, endpoint "
+                 f"{'high-volume' if EE_HIGH_VOLUME else 'standard'}.")
     else:
+        ee.Initialize(**kwargs)
         try:
-            ee.Initialize(**kwargs)
+            EE_CREDENTIALS = ee.data.get_persistent_credentials()
         except Exception:
-            if not (IN_COLAB or sys.stdin.isatty()):
-                raise RuntimeError("Chưa xác thực Earth Engine. Chạy một lần trong terminal: "
-                                   "python -c \"import ee; ee.Authenticate(auth_mode='notebook')\"")
-            ee.Authenticate(auth_mode="notebook")
-            ee.Initialize(**kwargs)
-        log.info(f"Earth Engine sẵn sàng (high-volume={EE_HIGH_VOLUME}).")
+            EE_CREDENTIALS = None
+        log.info("Earth Engine sẵn sàng (tài khoản cá nhân).")
     ee.data.setDeadline(EE_DEADLINE_SEC * 1000)
     communes_fc = ee.FeatureCollection(ASSET_ID)
 
 
-def build_commune_index():
-    """Bảng xã từ GADM 4.1, giữ nguyên cách làm của V12.6 (tải một lần, sau đó đọc cache)."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(INDEX_CSV):
-        return pd.read_csv(INDEX_CSV, dtype=str)
-    import geopandas as gpd
-    if not os.path.exists(SHP_L3_PATH):
-        if not os.path.exists(ZIP_PATH):
-            log.info("Tải ranh giới GADM 4.1 (~70 MB)...")
-            r = requests.get(GADM_VNM_URL, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=600)
-            r.raise_for_status()
-            with open(ZIP_PATH + ".part", "wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.replace(ZIP_PATH + ".part", ZIP_PATH)
-        with zipfile.ZipFile(ZIP_PATH, "r") as z:
-            z.extractall(EXTRACT_DIR)
-    try:
-        g = gpd.read_file(SHP_L3_PATH, columns=ADM_COLS, ignore_geometry=True)
-    except TypeError:
-        g = gpd.read_file(SHP_L3_PATH)
-    tbl = pd.DataFrame(g[ADM_COLS]).astype(str).drop_duplicates("GID_3")
-    tbl.to_csv(INDEX_CSV, index=False, encoding="utf-8-sig")
-    return tbl
-
-
-def load_targets():
-    idx = build_commune_index()
-    if PROVINCE_FILTER:
-        idx = idx[idx["GID_1"].isin(PROVINCE_FILTER)]
-    idx = idx.sort_values(["GID_1", "GID_3"]).reset_index(drop=True)
-    if TEST_LIMIT:
-        idx = idx.head(TEST_LIMIT)
-    return idx
-
-def _gid_variants(gid):
-    g = gid.strip()
-    base = re.sub(r"_\d+$", "", g)
-    return list(dict.fromkeys([g, base, base + "_1"]))
-
-
-def resolve_gid(gid_3):
-    for cand in _gid_variants(gid_3):
-        fc = communes_fc.filter(ee.Filter.eq("GID_3", cand))
-        if fc.size().getInfo() > 0:
-            return cand, fc
-    base = re.sub(r"_\d+$", "", gid_3.strip())
-    fc = communes_fc.filter(ee.Filter.stringStartsWith("GID_3", base))
-    if fc.size().getInfo() > 0:
-        found = fc.aggregate_array("GID_3").getInfo()
-        exact = [x for x in found if re.sub(r"_\d+$", "", x) == base]
-        if exact:
-            return exact[0], communes_fc.filter(ee.Filter.eq("GID_3", exact[0]))
-    raise ValueError(f"Không tìm thấy mã xã '{gid_3}' trong asset {ASSET_ID}.")
-
-
-def get_commune_info(gid_3):
-    asset_gid, fc = resolve_gid(gid_3)
-    feat = fc.first().getInfo()
-    props = feat.get("properties", {})
-    geom = fc.geometry()
-    area_ha = geom.area(maxError=1).getInfo() / 1e4
-    return {
-        "GID_3": gid_3.strip(), "GID_3_ASSET": asset_gid,
-        "NAME_3": props.get("NAME_3", ""), "TYPE_3": props.get("TYPE_3", ""),
-        "GID_2": props.get("GID_2", ""), "NAME_2": props.get("NAME_2", ""),
-        "GID_1": props.get("GID_1", ""), "NAME_1": props.get("NAME_1", ""),
-        "area_ha": area_ha, "geometry": geom, "geojson": feat.get("geometry"),
-    }
+# ---------- Task 1: chép nguyên văn notebook cell 15 (print -> _nb_print, thêm tham số commune_gid như bản [LOCAL]) ----------
+def mask_s2_sr(img):
+  qa = img.select("QA60")
+  cloud_mask = (qa.bitwiseAnd(1 << 10).eq(0)).And(qa.bitwiseAnd(1 << 11).eq(0))
+  return (
+      img.updateMask(cloud_mask)
+      .divide(10000)
+      .select(
+          ["B2", "B3", "B4", "B8", "B11", "B12"],
+          ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"],
+      )
+  )
 
 
 def add_indices(img):
-    ndvi = img.normalizedDifference(["NIR", "RED"]).rename("NDVI")
-    ndbi = img.normalizedDifference(["SWIR1", "NIR"]).rename("NDBI")
-    mndwi = img.normalizedDifference(["GREEN", "SWIR1"]).rename("MNDWI")
-    bsi = img.expression(
-        "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
-        {"SWIR1": img.select("SWIR1"), "RED": img.select("RED"),
-         "NIR": img.select("NIR"), "BLUE": img.select("BLUE")},
-    ).rename("BSI")
-    return img.addBands([ndvi, ndbi, mndwi, bsi])
+  ndvi = img.normalizedDifference(["NIR", "RED"]).rename("NDVI")
+  ndbi = img.normalizedDifference(["SWIR1", "NIR"]).rename("NDBI")
+  mndwi = img.normalizedDifference(["GREEN", "SWIR1"]).rename("MNDWI")
+  bsi = img.expression(
+      "((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))",
+      {
+          "SWIR1": img.select("SWIR1"),
+          "RED": img.select("RED"),
+          "NIR": img.select("NIR"),
+          "BLUE": img.select("BLUE"),
+      },
+  ).rename("BSI")
+  return img.addBands([ndvi, ndbi, mndwi, bsi])
 
 
-def _month_range(year, month):
-    ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
-    return f"{year}-{month:02d}-01", f"{ny}-{nm:02d}-01"
+def export_province_s2_local(
+    province_gid,
+    province_name,
+    year,
+    month,
+    save_dir=None,
+    gdf_admin=None,
+    commune_gid=None,
+):
+  prov_prefix = province_gid.replace("_1", "") + "."
+  prov_communes = communes_fc.filter(
+      ee.Filter.stringStartsWith("GID_3", prov_prefix)
+  )
+  if commune_gid is not None:
+    prov_communes = prov_communes.filter(ee.Filter.eq("GID_3", commune_gid))
 
+  _, last_day = calendar.monthrange(year, month)
+  s_date = f"{year}-{month:02d}-01"
+  e_date = f"{year}-{month:02d}-{last_day:02d}"
 
-L5_ID = "LANDSAT/LT05/C02/T1_L2"
-L7_ID = "LANDSAT/LE07/C02/T1_L2"
-L8_ID = "LANDSAT/LC08/C02/T1_L2"
+  collection_id = (
+      "COPERNICUS/S2_SR_HARMONIZED" if year >= 2019 else "COPERNICUS/S2_HARMONIZED"
+  )
+  _nb_print(f"[*] Nguồn dữ liệu: {collection_id}")
 
+  raw_col = (
+      ee.ImageCollection(collection_id)
+      .filterBounds(prov_communes)
+      .filterDate(s_date, e_date)
+  )
 
-def _mask_landsat_c2(img):
-    qa = img.select("QA_PIXEL")
-    clear = (qa.bitwiseAnd(1 << 0).eq(0).And(qa.bitwiseAnd(1 << 1).eq(0))
-             .And(qa.bitwiseAnd(1 << 3).eq(0)).And(qa.bitwiseAnd(1 << 4).eq(0)))
-    return img.select("SR_B.").multiply(0.0000275).add(-0.2).updateMask(clear)
-
-
-def prep_l8(img):
-    return _mask_landsat_c2(img).select(
-        ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
-        ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"])
-
-
-def prep_l5(img):
-    return _mask_landsat_c2(img).select(
-        ["SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B7"],
-        ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"])
-
-
-prep_l7 = prep_l5
-
-
-def get_landsat_collection(collection_id, geom, year, month):
-    s_date, e_date = _month_range(year, month)
-    return (ee.ImageCollection(collection_id).filterBounds(geom)
-            .filterDate(s_date, e_date).filter(ee.Filter.lt("CLOUD_COVER", MAX_CLOUD)))
-
-
-DAY_SENSOR_COLLECTIONS = {"Landsat-5": L5_ID, "Landsat-7(SLC-off)": L7_ID, "Landsat-8": L8_ID}
-
-
-def assigned_day_source(year):
-    if 2004 <= year <= 2011:
-        return "Landsat-5", L5_ID, prep_l5
-    if year == 2012:
-        return "Landsat-7(SLC-off)", L7_ID, prep_l7
-    if 2013 <= year <= 2026:
-        return "Landsat-8", L8_ID, prep_l8
-    raise ValueError(f"Năm {year} nằm ngoài kế hoạch nguồn Day 2004–2026")
-
-
-def build_monthly_composite(geom, year, month):
-    sensor, collection_id, prepare = assigned_day_source(year)
-    col = get_landsat_collection(collection_id, geom, year, month)
-    n_scenes = col.size().getInfo()
-    if n_scenes == 0:
-        return None, sensor, 0
-    return add_indices(col.map(prepare).median()), sensor, n_scenes
-
-
-VIIRS_ID_PRIMARY  = "NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG"
-VIIRS_ID_FALLBACK = "NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG"
-DMSP_ID = "NOAA/DMSP-OLS/NIGHTTIME_LIGHTS"
-
-
-def get_viirs_image(geom, year, month):
-    s_date, e_date = _month_range(year, month)
-    source_id = VIIRS_ID_PRIMARY
-    col = ee.ImageCollection(source_id).filterBounds(geom).filterDate(s_date, e_date)
-    if col.size().getInfo() == 0:
-        source_id = VIIRS_ID_FALLBACK
-        col = ee.ImageCollection(source_id).filterBounds(geom).filterDate(s_date, e_date)
-    if col.size().getInfo() == 0:
-        return None, None
-    return col.select(["avg_rad", "cf_cvg"]).mean().clip(geom), source_id
-
-
-def get_dmsp_image(geom, year):
-    col = (ee.ImageCollection(DMSP_ID).filterBounds(geom)
-           .filterDate(f"{year}-01-01", f"{year+1}-01-01"))
-    if col.size().getInfo() == 0:
-        return None
-    return col.select(["stable_lights", "cf_cvg"]).mean().clip(geom)
-
-
-def iter_months(y0, m0, y1, m1):
-    y, m = y0, m0
-    while (y, m) <= (y1, m1):
-        yield y, m
-        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
-
-
-_today_vn = datetime.now(timezone(timedelta(hours=7)))
-ACTUAL_END = min((END_YEAR, END_MONTH), (_today_vn.year, _today_vn.month))
-ALL_MONTHS = list(iter_months(START_YEAR, START_MONTH, *ACTUAL_END))
-VIIRS_MONTHS = [ym for ym in ALL_MONTHS if ym >= VIIRS_FIRST_DATE]
-DMSP_YEARS = list(range(START_YEAR, min(DMSP_LAST_YEAR, ACTUAL_END[0]) + 1))
-print(f"[+] Ảnh ngày: {len(ALL_MONTHS)} tháng | VIIRS: {len(VIIRS_MONTHS)} tháng | DMSP: {len(DMSP_YEARS)} năm")
-
-def download_month_image(gid_3, geom, year, month, out_dir, file_stem, scale=SCALE, max_retry=3):
-    """Trả (path, sensor, n_scenes). path=None và n_scenes>0 nghĩa là tải hỏng."""
-    fname = make_image_name(file_stem, year, month, "Day")
-    path = os.path.join(out_dir, fname)
-    if (not OVERWRITE) and os.path.exists(path) and os.path.getsize(path) > 2000:
-        sidecar = path + ".json"
-        if os.path.isfile(sidecar):
-            with open(sidecar, encoding="utf-8") as f:
-                meta = json.load(f)
-            return path, meta["sensor"], meta["n_scenes"]
-        _, sensor, n_scenes = build_monthly_composite(geom, year, month)
-        with open(sidecar, "w", encoding="utf-8") as f:
-            json.dump({"sensor": sensor, "n_scenes": n_scenes}, f)
-        return path, sensor, n_scenes
-
-    img, sensor, n_scenes = build_monthly_composite(geom, year, month)
-    if img is None:
-        return None, None, 0
-    export_img = img.select(BAND_ORDER).toFloat().clip(geom)
-    scales = [scale] if scale == SCALE_FALLBACK else [scale, SCALE_FALLBACK]
-    last_err = None
-    for cur_scale in scales:
-        for attempt in range(max_retry):
-            tmp = path + ".part"
-            try:
-                url = export_img.getDownloadURL({"scale": cur_scale, "crs": "EPSG:4326", "region": geom,
-                                                 "format": "GEO_TIFF", "filePerBand": False})
-                r = requests.get(url, stream=True, timeout=600)
-                r.raise_for_status()
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                if os.path.getsize(tmp) < 2000:
-                    os.remove(tmp)
-                    raise IOError("file tải về rỗng / quá nhỏ")
-                os.replace(tmp, path)
-                with open(path + ".json", "w", encoding="utf-8") as f:
-                    json.dump({"sensor": sensor, "n_scenes": n_scenes}, f)
-                if cur_scale != scale:
-                    log.info(f"[{gid_3}] {year}-{month:02d}: hạ xuống {cur_scale} m do quá hạn mức ở {scale} m")
-                return path, sensor, n_scenes
-            except Exception as e:
-                last_err = e
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                msg = str(e).lower()
-                if "too large" in msg or "request size" in msg or "limit" in msg:
-                    break
-                time.sleep(3 * (attempt + 1))
-    log.warning(f"[{gid_3}] Day {year}-{month:02d}: tải thất bại ({last_err})")
-    return None, sensor, n_scenes
-
-
-def _download_night_image(img, path, geom, scale, label, max_retry=3):
-    if img is None:
-        return None
-    last_err = None
-    for attempt in range(max_retry):
-        tmp = path + ".part"
-        try:
-            url = img.toFloat().clip(geom).getDownloadURL({"scale": scale, "crs": "EPSG:4326", "region": geom,
-                                                           "format": "GEO_TIFF", "filePerBand": False})
-            with requests.get(url, stream=True, timeout=300) as response:
-                response.raise_for_status()
-                with open(tmp, "wb") as f:
-                    for chunk in response.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-            if os.path.getsize(tmp) < 500:
-                raise IOError("File ảnh rỗng hoặc quá nhỏ")
-            os.replace(tmp, path)
-            return path
-        except Exception as exc:
-            last_err = exc
-            if os.path.exists(tmp):
-                os.remove(tmp)
-            if attempt < max_retry - 1:
-                time.sleep(3 * (attempt + 1))
-    log.warning(f"{label}: tải ảnh đêm thất bại ({last_err})")
+  img_count = raw_col.size().getInfo()
+  if img_count == 0:
+    _nb_print(f"[-] Không có cảnh ảnh nào trong tháng {month:02d}/{year}")
     return None
 
+  filtered_col = raw_col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 85))
+  if filtered_col.size().getInfo() == 0:
+    composite = raw_col.map(mask_s2_sr).median()
+  else:
+    composite = filtered_col.map(mask_s2_sr).median()
 
-def download_dmsp_annual_image(gid_3, geom, year, out_dir, file_stem, max_retry=3):
-    path = os.path.join(out_dir, f"{file_stem}_{year}_DMSP.tif")
-    if not OVERWRITE and os.path.exists(path) and os.path.getsize(path) > 500:
-        return path
-    return _download_night_image(get_dmsp_image(geom, year), path, geom, DMSP_SCALE,
-                                 f"[{gid_3}] DMSP {year}", max_retry)
+  tensor = add_indices(composite)
+  bands = [
+      "BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2",
+      "NDVI", "NDBI", "MNDWI", "BSI",
+  ]
+  reducers = ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True)
+
+  stats = tensor.select(bands).reduceRegions(
+      collection=prov_communes,
+      reducer=reducers,
+      scale=50,
+      tileScale=4,
+      crs="EPSG:4326",
+  )
+
+  feature_cols = [
+      "BLUE_mean", "BLUE_stdDev", "GREEN_mean", "GREEN_stdDev",
+      "RED_mean", "RED_stdDev", "NIR_mean", "NIR_stdDev",
+      "SWIR1_mean", "SWIR1_stdDev", "SWIR2_mean", "SWIR2_stdDev",
+      "NDVI_mean", "NDVI_stdDev", "NDBI_mean", "NDBI_stdDev",
+      "MNDWI_mean", "MNDWI_stdDev", "BSI_mean", "BSI_stdDev",
+  ]
+  selected_cols = ["GID_3"] + feature_cols
+
+  features = stats.select(selected_cols).getInfo()["features"]
+  rows = [f["properties"] for f in features]
+  df_s2 = pd.DataFrame(rows)
+
+  if gdf_admin is not None:
+    admin_cols = ["GID_1", "NAME_1", "GID_2", "NAME_2", "GID_3", "NAME_3", "TYPE_3"]
+    existing_cols = [c for c in admin_cols if c in gdf_admin.columns]
+    lookup = gdf_admin[existing_cols].drop_duplicates(subset=["GID_3"])
+    df_res = pd.merge(lookup, df_s2, on="GID_3", how="inner")
+  else:
+    df_res = df_s2
+  # Bản notebook ghi thêm 1 CSV cho từng tháng; pipeline chỉ giữ file gộp 12 tháng (save_dir=None).
+  return df_res
 
 
-def download_viirs_month_image(gid_3, geom, year, month, out_dir, file_stem, max_retry=3):
-    """Trả (path, collection). path=None và collection khác None nghĩa là tải hỏng."""
-    path = os.path.join(out_dir, f"{file_stem}_{year}{month:02d}_VIIRS.tif")
-    if not OVERWRITE and os.path.exists(path) and os.path.getsize(path) > 500:
-        sidecar = path + ".json"
-        if os.path.isfile(sidecar):
-            with open(sidecar, encoding="utf-8") as f:
-                return path, json.load(f)["source_collection"]
-        _, collection_id = get_viirs_image(geom, year, month)
-        with open(sidecar, "w", encoding="utf-8") as f:
-            json.dump({"source_collection": collection_id}, f)
-        return path, collection_id
-    image, collection_id = get_viirs_image(geom, year, month)
-    path = _download_night_image(image, path, geom, VIIRS_SCALE,
-                                 f"[{gid_3}] VIIRS {year}-{month:02d}", max_retry)
-    if path is not None:
-        with open(path + ".json", "w", encoding="utf-8") as f:
-            json.dump({"source_collection": collection_id}, f)
-    return path, collection_id
-
-import rasterio
-import cv2
-import pyproj
-from shapely.geometry import box as shp_box
-from shapely.ops import transform as shp_transform
-from skimage.morphology import remove_small_objects, skeletonize
-from skimage.measure import label, regionprops
+# ---------- Task 2: chép nguyên văn notebook cell 18 ----------
+def mask_s2_clean(img):
+  qa = img.select("QA60")
+  cloud_mask = (qa.bitwiseAnd(1 << 10).eq(0)).And(qa.bitwiseAnd(1 << 11).eq(0))
+  return (
+      img.updateMask(cloud_mask)
+      .divide(10000)
+      .select(
+          ["B2", "B3", "B4", "B8", "B11", "B12"],
+          ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2"],
+      )
+  )
 
 
-def read_stack(image_path):
-    with rasterio.open(image_path) as src:
-        arr = src.read().astype(float)
-        names = list(src.descriptions or [])
-        if names and all(names) and set(BAND_ORDER).issubset(set(names)):
-            idx = {n: names.index(n) for n in BAND_ORDER}
+def get_adaptive_monthly_composite(year, month, commune_geom, collection_id):
+  _, last_day = calendar.monthrange(year, month)
+  dt_start = datetime(year, month, 1)
+  dt_end = datetime(year, month, last_day)
+
+  s_date = dt_start.strftime("%Y-%m-%d")
+  e_date = dt_end.strftime("%Y-%m-%d")
+
+  col = (
+      ee.ImageCollection(collection_id)
+      .filterBounds(commune_geom)
+      .filterDate(s_date, e_date)
+  )
+
+  if col.size().getInfo() == 0:
+    exp_start = (dt_start - timedelta(days=15)).strftime("%Y-%m-%d")
+    exp_end = (dt_end + timedelta(days=15)).strftime("%Y-%m-%d")
+
+    col = (
+        ee.ImageCollection(collection_id)
+        .filterBounds(commune_geom)
+        .filterDate(exp_start, exp_end)
+    )
+
+    if col.size().getInfo() == 0:
+      exp_start_max = (dt_start - timedelta(days=30)).strftime("%Y-%m-%d")
+      exp_end_max = (dt_end + timedelta(days=30)).strftime("%Y-%m-%d")
+
+      col = (
+          ee.ImageCollection(collection_id)
+          .filterBounds(commune_geom)
+          .filterDate(exp_start_max, exp_end_max)
+      )
+
+  if col.size().getInfo() > 0:
+    return col.map(mask_s2_clean).median()
+  return None
+
+
+# ---------- Task 3: chép nguyên văn notebook cell 34 ----------
+def get_viirs_monthly_composite(year, month, commune_geom):
+  _, last_day = calendar.monthrange(year, month)
+  s_date = f"{year}-{month:02d}-01"
+  e_date = f"{year}-{month:02d}-{last_day:02d}"
+
+  col = (
+      ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG")
+      .filterBounds(commune_geom)
+      .filterDate(s_date, e_date)
+  )
+
+  if col.size().getInfo() == 0:
+    col = (
+        ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG")
+        .filterBounds(commune_geom)
+        .filterDate(s_date, e_date)
+    )
+
+  if col.size().getInfo() > 0:
+    return (
+        col.select(["avg_rad", "cf_cvg"])
+        .mean()
+        .clip(commune_geom)
+        .set("system:time_start", s_date)
+    )
+  return None
+
+
+# ---------- Task 3.2: chép nguyên văn notebook cell 38 (bọc thành hàm, print -> _nb_print) ----------
+def compute_ntl_indices(commune_geom, target_prov_gid, matched_prov_name, matched_gid3, matched_cname):
+  start_year = YEAR
+  start_month = 1
+  current_year = YEAR
+  current_month = 12
+
+  commune_area_ha = (
+      commune_geom.area(maxError=1).divide(10000).getInfo()
+  )
+
+  records = []
+
+  reducers = (
+      ee.Reducer.sum()
+      .combine(ee.Reducer.mean(), sharedInputs=True)
+      .combine(ee.Reducer.stdDev(), sharedInputs=True)
+      .combine(ee.Reducer.min(), sharedInputs=True)
+      .combine(ee.Reducer.max(), sharedInputs=True)
+      .combine(ee.Reducer.count(), sharedInputs=True)
+  )
+
+  for yr in range(start_year, current_year + 1):
+    end_m = current_month if yr == current_year else 12
+    for m in range(1, end_m + 1):
+      check_stop()
+      _, last_day = calendar.monthrange(yr, m)
+      s_date = f"{yr}-{m:02d}-01"
+      e_date = f"{yr}-{m:02d}-{last_day:02d}"
+
+      col = (
+          ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG")
+          .filterBounds(commune_geom)
+          .filterDate(s_date, e_date)
+      )
+      if col.size().getInfo() == 0:
+        col = (
+            ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG")
+            .filterBounds(commune_geom)
+            .filterDate(s_date, e_date)
+        )
+
+      if col.size().getInfo() == 0:
+        _nb_print(f"  [-] Tháng {m:02d}/{yr}: Không có ảnh vệ tinh.")
+        continue
+
+      img = col.mean().clip(commune_geom)
+
+      rad = img.select("avg_rad")
+      cf_cvg = img.select("cf_cvg")
+
+      lit_mask = rad.gte(1.5).rename("is_lit")
+      lit_rad = rad.updateMask(lit_mask).rename("lit_rad")
+
+      stats_all = rad.reduceRegion(
+          reducer=reducers, geometry=commune_geom, scale=500, maxPixels=1e9, crs="EPSG:4326",
+      ).getInfo()
+
+      stats_lit = lit_rad.reduceRegion(
+          reducer=ee.Reducer.sum(), geometry=commune_geom, scale=500, maxPixels=1e9, crs="EPSG:4326",
+      ).getInfo()
+
+      lit_pixel_count = lit_mask.reduceRegion(
+          reducer=ee.Reducer.sum(), geometry=commune_geom, scale=500, maxPixels=1e9, crs="EPSG:4326",
+      ).getInfo().get("is_lit", 0)
+
+      cloud_free_obs = cf_cvg.reduceRegion(
+          reducer=ee.Reducer.mean(), geometry=commune_geom, scale=500, maxPixels=1e9, crs="EPSG:4326",
+      ).getInfo().get("cf_cvg", 0)
+
+      total_pixels = stats_all.get("avg_rad_count", 0)
+      tnl = stats_all.get("avg_rad_sum", 0.0) or 0.0
+      mean_rad = stats_all.get("avg_rad_mean", 0.0) or 0.0
+      std_rad = stats_all.get("avg_rad_stdDev", 0.0) or 0.0
+      min_rad = stats_all.get("avg_rad_min", 0.0) or 0.0
+      max_rad = stats_all.get("avg_rad_max", 0.0) or 0.0
+
+      lit_pop_proxy = (
+          stats_lit.get("lit_rad", 0.0) or 0.0
+      )
+
+      electrification_ratio = (
+          (lit_pixel_count / total_pixels * 100.0) if total_pixels > 0 else 0.0
+      )
+
+      lit_area_ha = lit_pixel_count * 25.0
+
+      spatial_cv = (std_rad / mean_rad) if mean_rad > 0 else 0.0
+
+      records.append({
+          "GID_1": target_prov_gid,
+          "NAME_1": matched_prov_name,
+          "GID_3": matched_gid3,
+          "NAME_3": matched_cname,
+          "YEAR": yr,
+          "MONTH": m,
+          "TIME": f"{yr}-{m:02d}",
+          "COMMUNE_AREA_HA": round(commune_area_ha, 2),
+          "TNL": round(tnl, 4),
+          "MEAN_RAD": round(mean_rad, 4),
+          "STD_RAD": round(std_rad, 4),
+          "MIN_RAD": round(min_rad, 4),
+          "MAX_RAD": round(max_rad, 4),
+          "SPATIAL_CV": round(spatial_cv, 4),
+          "LIT_PIXELS": int(lit_pixel_count),
+          "LIT_AREA_HA": round(lit_area_ha, 2),
+          "ELECTRIFICATION_RATIO_PCT": round(electrification_ratio, 2),
+          "LIT_POP_PROXY": round(lit_pop_proxy, 4),
+          "CLOUD_FREE_OBS": round(cloud_free_obs, 1),
+      })
+
+  df_ntl = pd.DataFrame(records)
+  if df_ntl.empty:
+    # Notebook sẽ báo KeyError ở dòng dưới; pipeline báo lỗi rõ ràng thay vì ghi file rỗng.
+    raise RuntimeError("Task 3.2: không tháng nào có ảnh VIIRS cho xã này.")
+
+  df_ntl["TNL_MA3"] = df_ntl["TNL"].rolling(window=3, min_periods=1).mean()
+  df_ntl["TNL_MOM_GROWTH_PCT"] = df_ntl["TNL"].pct_change() * 100.0
+  return df_ntl
+
+
+# =====================================================================================
+# 5. TẢI ẢNH (getDownloadURL như notebook cell 21) + CHIA Ô KHI QUÁ HẠN MỨC
+# =====================================================================================
+_dl_lock = threading.Lock()
+_dl_stats = {"ok": 0, "fail": 0, "last_err": ""}
+_PERMANENT_ERR = ("401", "403", "forbidden", "unauthorized", "permission denied", "permission_denied",
+                  "not authorized", "caller does not have permission")
+_TOO_LARGE_ERR = ("must be less than or equal to", "request size", "too large", "request payload size",
+                  "user memory limit", "pixel grid dimensions")
+
+
+class PermanentError(RuntimeError):
+    pass
+
+
+class TooLargeError(RuntimeError):
+    pass
+
+
+def _dl_record(ok, err=None):
+    trip = False
+    with _dl_lock:
+        if ok:
+            _dl_stats["ok"] += 1
         else:
-            idx = {n: i for i, n in enumerate(BAND_ORDER) if i < src.count}
-        bands = {n: arr[i] for n, i in idx.items()}
-        red, green, blue = bands["RED"], bands["GREEN"], bands["BLUE"]
-        finite = np.isfinite(red) & np.isfinite(green) & np.isfinite(blue)
-        commune_mask = finite & ((red > 0) | (green > 0) | (blue > 0))
-        if src.nodata is not None:
-            commune_mask &= (red != src.nodata)
-        tr, crs = src.transform, src.crs
-        if crs is not None and crs.is_projected:
-            res_x, res_y = abs(tr[0]), abs(tr[4])
-            pixel_area_m2 = res_x * res_y
-        else:
-            b = src.bounds
-            lon_c, lat_c = (b.left + b.right) / 2, (b.bottom + b.top) / 2
-            utm_zone = int((lon_c + 180) / 6) + 1
-            hemi = "" if lat_c >= 0 else " +south"
-            utm_crs = f"+proj=utm +zone={utm_zone}{hemi} +datum=WGS84 +units=m +no_defs"
-            project = pyproj.Transformer.from_crs(crs, utm_crs, always_xy=True).transform
-            cell = shp_box(b.left, b.bottom, b.left + abs(tr[0]), b.bottom + abs(tr[4]))
-            pixel_area_m2 = shp_transform(project, cell).area
-            res_x = res_y = math.sqrt(pixel_area_m2)
-        meta = {"height": src.height, "width": src.width, "n_bands": src.count,
-                "res_m": res_x, "pixel_area_m2": pixel_area_m2}
-    nir, swir1 = bands["NIR"], bands["SWIR1"]
-    if "NDVI" not in bands:
-        bands["NDVI"] = (nir - red) / (nir + red + 1e-6)
-    if "NDBI" not in bands:
-        bands["NDBI"] = (swir1 - nir) / (swir1 + nir + 1e-6)
-    if "MNDWI" not in bands:
-        bands["MNDWI"] = (green - swir1) / (green + swir1 + 1e-6)
-    return bands, commune_mask, meta
+            _dl_stats["fail"] += 1
+            _dl_stats["last_err"] = str(err)[:500]
+            trip = _dl_stats["ok"] == 0 and _dl_stats["fail"] >= DOWNLOAD_FAIL_LIMIT
+    if trip:
+        log.error(f"{DOWNLOAD_FAIL_LIMIT} lượt tải liên tiếp thất bại, chưa có lượt nào thành công. "
+                  f"Lỗi gần nhất: {_dl_stats['last_err']}")
+        request_stop("fatal")
 
 
-def extract_road_metrics(bands, commune_mask, meta):
-    ndvi = np.nan_to_num(bands["NDVI"], nan=1.0)
-    ndbi = np.nan_to_num(bands["NDBI"], nan=-1.0)
-    mndwi = np.nan_to_num(bands["MNDWI"], nan=1.0)
-    road_spectral_mask = (ndvi < 0.25) & (mndwi < -0.05) & (ndbi > -0.10) & commune_mask
-    binary_road = (road_spectral_mask * 255).astype(np.uint8)
-    kernel_len = 5
-    k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
-    k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
-    linear_roads = cv2.bitwise_or(cv2.morphologyEx(binary_road, cv2.MORPH_OPEN, k_h),
-                                  cv2.morphologyEx(binary_road, cv2.MORPH_OPEN, k_v))
-    clean_roads = remove_small_objects(linear_roads > 0, min_size=10)
-    road_skeleton = skeletonize(clean_roads)
-    road_px, center_px = int(np.sum(clean_roads)), int(np.sum(road_skeleton))
-    return {"road_corridor_pixels": road_px, "road_centerline_pixels": center_px,
-            "road_length_km": center_px * meta["res_m"] / 1000.0,
-            "road_area_ha": road_px * meta["pixel_area_m2"] / 1e4}
-
-
-def extract_industrial_metrics(bands, commune_mask, meta):
-    green, red, nir, swir1 = bands["GREEN"], bands["RED"], bands["NIR"], bands["SWIR1"]
-    ndvi = np.nan_to_num((nir - red) / (nir + red + 1e-6), nan=1.0)
-    mndwi = np.nan_to_num((green - swir1) / (green + swir1 + 1e-6), nan=1.0)
-    ndmri = np.nan_to_num((swir1 - nir) / (swir1 + nir + 1e-6), nan=-1.0)
-    swir1_f = np.nan_to_num(swir1, nan=0.0)
-    industrial_spectral = ((swir1_f > 0.18) & (ndmri > 0.05) & (ndvi < 0.25)
-                           & (mndwi < -0.05) & commune_mask)
-    labeled_mask = label(industrial_spectral)
-    clean = np.zeros_like(industrial_spectral, dtype=bool)
-    n_clusters = 0
-    for r in regionprops(labeled_mask):
-        if r.area >= 5:
-            clean[labeled_mask == r.label] = True
-            n_clusters += 1
-    ind_px = int(np.sum(clean))
-    ind_m2 = ind_px * meta["pixel_area_m2"]
-    return {"industrial_clusters": n_clusters, "industrial_pixels": ind_px,
-            "industrial_area_ha": ind_m2 / 1e4, "industrial_area_m2": ind_m2}
-
-
-def extract_water_metrics(bands, commune_mask, meta):
-    green, red, nir, swir1 = bands["GREEN"], bands["RED"], bands["NIR"], bands["SWIR1"]
-    green_f = np.nan_to_num(green, nan=0.0)
-    swir1_f = np.nan_to_num(swir1, nan=1.0)
-    mndwi = np.nan_to_num((green - swir1) / (green + swir1 + 1e-6), nan=-1.0)
-    ndvi = np.nan_to_num((nir - red) / (nir + red + 1e-6), nan=1.0)
-    water_mask = (mndwi > 0.12) & (ndvi < 0.15) & (green_f > 0.04) & (swir1_f < 0.10) & commune_mask
-    clean_water = remove_small_objects(water_mask, min_size=4)
-    labeled_water = label(clean_water)
-    natural = np.zeros_like(clean_water, dtype=bool)
-    aqua = np.zeros_like(clean_water, dtype=bool)
-    pixel_area_m2 = meta["pixel_area_m2"]
-    n_natural = n_aqua = 0
-    for r in regionprops(labeled_water):
-        area_m2 = r.area * pixel_area_m2
-        aspect_ratio = r.major_axis_length / (r.minor_axis_length + 1e-6)
-        if area_m2 >= 12000 or (aspect_ratio >= 4.0 and area_m2 >= 8000):
-            natural[labeled_water == r.label] = True; n_natural += 1
-        else:
-            aqua[labeled_water == r.label] = True; n_aqua += 1
-    total_px = int(np.sum(clean_water))
-    return {"water_pixels": total_px, "water_area_ha": total_px * pixel_area_m2 / 1e4,
-            "water_natural_ha": int(np.sum(natural)) * pixel_area_m2 / 1e4,
-            "water_aquaculture_ha": int(np.sum(aqua)) * pixel_area_m2 / 1e4,
-            "water_natural_bodies": n_natural, "water_aquaculture_bodies": n_aqua}
-
-
-def extract_spectral_stats(bands, commune_mask):
-    out = {}
-    for name in BAND_ORDER:
-        vals = bands[name][commune_mask] if name in bands else np.array([])
-        vals = vals[np.isfinite(vals)]
-        out[f"{name}_mean"] = round(float(np.mean(vals)), 6) if vals.size else np.nan
-        out[f"{name}_stdDev"] = round(float(np.std(vals)), 6) if vals.size else np.nan
-    return out
-
-
-def analyze_image(image_path):
-    bands, commune_mask, meta = read_stack(image_path)
-    valid_px = int(np.sum(commune_mask))
-    row = {"img_height": meta["height"], "img_width": meta["width"], "n_bands": meta["n_bands"],
-           "pixel_size_m": round(meta["res_m"], 2), "valid_pixels": valid_px,
-           "valid_area_ha": valid_px * meta["pixel_area_m2"] / 1e4}
-    row.update(extract_road_metrics(bands, commune_mask, meta))
-    row.update(extract_industrial_metrics(bands, commune_mask, meta))
-    row.update(extract_water_metrics(bands, commune_mask, meta))
-    row.update(extract_spectral_stats(bands, commune_mask))
-    if row["valid_area_ha"] > 0:
-        km2 = row["valid_area_ha"] / 100.0
-        row["road_density_km_per_km2"] = row["road_length_km"] / km2
-        row["industrial_share_pct"] = 100.0 * row["industrial_area_ha"] / row["valid_area_ha"]
-        row["water_share_pct"] = 100.0 * row["water_area_ha"] / row["valid_area_ha"]
-    else:
-        row["road_density_km_per_km2"] = row["industrial_share_pct"] = row["water_share_pct"] = np.nan
-    return row
-
-
-def analyze_night_image(image_path, sensor, band, scale_m, lit_threshold):
-    with rasterio.open(image_path) as src:
-        main = src.read(1, masked=True).astype(float).filled(np.nan).astype(float)
-        cf_cvg = src.read(2, masked=True).astype(float).filled(np.nan) if src.count >= 2 else None
-        nodata = src.nodata
-        transform, crs, height, width = src.transform, src.crs, src.height, src.width
-    valid = np.isfinite(main)
-    if cf_cvg is not None:
-        valid &= np.isfinite(cf_cvg) & (cf_cvg > 0)
-    if nodata is not None:
-        valid &= (main != nodata)
-    n_valid = int(valid.sum())
-    if n_valid == 0:
-        return {}
-    vals = main[valid]
-    lit_mask = valid & (main >= lit_threshold)
-    lit_vals = main[lit_mask]
-    n_lit = int(lit_mask.sum())
-    from pyproj import Geod, Transformer
-    geod = Geod(ellps="WGS84")
-    to_ll = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-    row_areas = np.zeros(height, dtype=float)
-    for rr in range(height):
-        corners = [transform * (cc, r) for cc, r in [(width/2, rr), (width/2+1, rr),
-                                                     (width/2+1, rr+1), (width/2, rr+1)]]
-        lon, lat = zip(*(to_ll.transform(x, y) for x, y in corners))
-        row_areas[rr] = abs(geod.polygon_area_perimeter(lon, lat)[0])
-    lit_area_ha = float(np.dot(lit_mask.sum(axis=1), row_areas) / 1e4)
-    mean_v, std_v = float(np.mean(vals)), float(np.std(vals))
-    row = {
-        "night_img_width_px": width, "night_img_height_px": height, "night_valid_pixels": n_valid,
-        "night_sensor": sensor, "night_band": band, "night_scale_m": scale_m,
-        "night_tnl": round(float(np.sum(vals)), 4), "night_mean": round(mean_v, 4),
-        "night_std": round(std_v, 4), "night_min": round(float(np.min(vals)), 4),
-        "night_max": round(float(np.max(vals)), 4),
-        "night_spatial_cv": round(std_v / mean_v, 4) if mean_v > 0 else 0.0,
-        "night_lit_pixels": n_lit, "night_lit_area_ha": round(lit_area_ha, 2),
-        "night_electrification_pct": round(100.0 * n_lit / n_valid, 2),
-        "night_lit_pop_proxy": round(float(np.sum(lit_vals)), 4),
-    }
-    if cf_cvg is not None:
-        cf_valid = cf_cvg[valid]
-        row["night_cloud_free_obs"] = round(float(np.nanmean(cf_valid)), 2) if cf_valid.size else np.nan
-    else:
-        row["night_cloud_free_obs"] = np.nan
-    return row
-
-
-def get_night_lit_threshold(sensor):
-    return VIIRS_LIT_THRESHOLD if sensor == "VIIRS" else DMSP_LIT_THRESHOLD
-
-import geopandas as gpd
-from shapely.geometry import LineString, shape as shp_shape
-
-OVERPASS_MIRRORS = [
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-]
-MAIN_ROAD_TYPES = {"motorway", "trunk", "primary", "secondary", "tertiary",
-                   "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link"}
-_osm_lock = threading.Lock()
-_osm_last = [0.0]
-
-
-def _overpass_post(url, query, headers):
-    """Mọi luồng xếp hàng qua một khóa để không dồn truy vấn lên máy chủ Overpass công cộng."""
-    with _osm_lock:
-        wait = OSM_MIN_INTERVAL_SEC - (time.time() - _osm_last[0])
-        if wait > 0:
-            time.sleep(wait)
-        _osm_last[0] = time.time()
-    return requests.post(url, data={"data": query}, headers=headers, timeout=90)
-
-
-def fetch_osm_road_length(commune):
-    poly = shp_shape(commune["geojson"])
-    west, south, east, north = poly.bounds
-    query = f"""
-[out:json][timeout:60];
-(
-  way["highway"]({south},{west},{north},{east});
-);
-out geom;
-"""
-    headers = {"User-Agent": "ResearchSpatialEcon/1.0 (contact@research.edu)"}
-    elements = None
-    for url in OVERPASS_MIRRORS:
+def _http_get(url, timeout=600):
+    r = requests.get(url, timeout=timeout)
+    if r.status_code in (401, 403) and EE_CREDENTIALS is not None:
         try:
-            resp = _overpass_post(url, query, headers)
-            if resp.status_code == 200:
-                elements = resp.json().get("elements", [])
-                break
-        except Exception:
+            from google.auth.transport.requests import AuthorizedSession
+            r2 = AuthorizedSession(EE_CREDENTIALS).get(url, timeout=timeout)
+            if r2.status_code < 400:
+                return r2
+            r = r2
+        except Exception as exc:
+            log.debug(f"AuthorizedSession lỗi: {exc}")
+    return r
+
+
+def _classify(msg):
+    low = msg.lower()
+    if any(k in low for k in _TOO_LARGE_ERR):
+        return "too_large"
+    if any(k in low for k in _PERMANENT_ERR):
+        return "permanent"
+    return "transient"
+
+
+def fetch_geotiff_bytes(img, region, scale, max_retry=4):
+    """Đúng tham số notebook cell 21. Trả bytes GeoTIFF; lỗi nào cũng kèm mã HTTP và nội dung."""
+    last = None
+    for attempt in range(max_retry):
+        check_stop()
+        try:
+            url = img.getDownloadURL({"region": region, "scale": scale, "crs": "EPSG:4326",
+                                      "format": "GEO_TIFF", "filePerBand": False})
+        except ee.EEException as exc:
+            kind = _classify(str(exc))
+            if kind == "too_large":
+                raise TooLargeError(str(exc))
+            if kind == "permanent":
+                raise PermanentError(f"getDownloadURL bị từ chối: {exc}")
+            last = f"getDownloadURL: {exc}"
+            time.sleep(5 * (attempt + 1))
             continue
-    if elements is None:
-        return {"osm_road_km_total": np.nan, "osm_road_km_main": np.nan, "osm_road_segments": 0}
-    lines, types = [], []
-    for el in elements:
-        if "geometry" in el and len(el["geometry"]) >= 2:
-            lines.append(LineString([(p["lon"], p["lat"]) for p in el["geometry"]]))
-            types.append(el.get("tags", {}).get("highway", "residential"))
-    if not lines:
-        return {"osm_road_km_total": 0.0, "osm_road_km_main": 0.0, "osm_road_segments": 0}
-    gdf = gpd.GeoDataFrame({"highway": types, "geometry": lines}, crs="EPSG:4326").clip(poly)
-    if gdf.empty:
-        return {"osm_road_km_total": 0.0, "osm_road_km_main": 0.0, "osm_road_segments": 0}
-    utm_epsg = 32600 + int(((west + east) / 2 + 180) / 6) + 1
-    gdf_utm = gdf.to_crs(f"EPSG:{utm_epsg}")
-    total_km = gdf_utm.geometry.length.sum() / 1000.0
-    main_km = gdf_utm[gdf_utm["highway"].isin(MAIN_ROAD_TYPES)].geometry.length.sum() / 1000.0
-    return {"osm_road_km_total": round(total_km, 4), "osm_road_km_main": round(main_km, 4),
-            "osm_road_segments": int(len(gdf))}
-
-
-def get_osm_cached(commune):
-    """Trả (dict OSM, ok). Chỉ lưu đệm khi tải thành công nên lần thử lại không truy vấn lại."""
-    empty = {"osm_road_km_total": np.nan, "osm_road_km_main": np.nan, "osm_road_segments": np.nan}
-    if not FETCH_OSM_REFERENCE:
-        return empty, True
-    cache = os.path.join(OSM_CACHE_DIR, f"{commune['GID_3']}.json")
-    if os.path.isfile(cache):
-        with open(cache, encoding="utf-8") as f:
-            return json.load(f), True
-    try:
-        osm = fetch_osm_road_length(commune)
-    except Exception as exc:
-        log.warning(f"[{commune['GID_3']}] OSM lỗi: {exc}")
-        return empty, False
-    if pd.isna(osm["osm_road_km_total"]):
-        return osm, False
-    _atomic_json(cache, osm)
-    return osm, True
-
-ADMIN_COLUMNS = ["gid_3", "name_3", "type_3", "gid_2", "name_2", "gid_1", "name_1", "commune_area_ha"]
-DAY_COLUMNS = ADMIN_COLUMNS + [
-    "date", "year", "month", "sensor", "source_collection", "source_policy",
-    "n_scenes", "image_file",
-    "img_height", "img_width", "n_bands", "pixel_size_m", "valid_pixels", "valid_area_ha",
-    "road_corridor_pixels", "road_centerline_pixels", "road_length_km", "road_area_ha",
-    "road_density_km_per_km2", "industrial_clusters", "industrial_pixels",
-    "industrial_area_ha", "industrial_area_m2", "industrial_share_pct",
-    "water_pixels", "water_area_ha", "water_natural_ha", "water_aquaculture_ha",
-    "water_natural_bodies", "water_aquaculture_bodies", "water_share_pct",
-    "osm_road_km_total", "osm_road_km_main", "osm_road_segments",
-] + [f"{b}_{stat}" for b in BAND_ORDER for stat in ("mean", "stdDev")]
-NIGHT_COLUMNS = ADMIN_COLUMNS + [
-    "date", "year", "month", "sensor", "temporal_resolution", "value_unit",
-    "source_band", "source_collection", "image_file", "scale_m",
-    "raster_width_px", "raster_height_px", "valid_pixel_count", "ntl_sum",
-    "ntl_mean", "ntl_std", "ntl_min", "ntl_max", "spatial_cv",
-    "lit_pixels", "lit_area_ha", "lit_ratio_pct", "lit_pop_proxy",
-    "cloud_free_obs", "ntl_ma3", "ntl_mom_growth_pct",
-]
-NIGHT_METRIC_MAP = {
-    "night_img_width_px": "raster_width_px", "night_img_height_px": "raster_height_px",
-    "night_valid_pixels": "valid_pixel_count", "night_tnl": "ntl_sum", "night_mean": "ntl_mean",
-    "night_std": "ntl_std", "night_min": "ntl_min", "night_max": "ntl_max",
-    "night_spatial_cv": "spatial_cv", "night_lit_pixels": "lit_pixels",
-    "night_lit_area_ha": "lit_area_ha", "night_electrification_pct": "lit_ratio_pct",
-    "night_lit_pop_proxy": "lit_pop_proxy", "night_cloud_free_obs": "cloud_free_obs",
-}
-
-
-def _admin(commune):
-    return {"gid_3": commune["GID_3"], "name_3": commune["NAME_3"], "type_3": commune["TYPE_3"],
-            "gid_2": commune["GID_2"], "name_2": commune["NAME_2"], "gid_1": commune["GID_1"],
-            "name_1": commune["NAME_1"], "commune_area_ha": round(commune["area_ha"], 4)}
-
-
-def _write_csv(rows, path, columns):
-    df = pd.DataFrame(rows).reindex(columns=columns).round(4)
-    tmp = path + ".part"
-    df.to_csv(tmp, index=False, encoding="utf-8-sig")
-    os.replace(tmp, path)
-    return df
-
-
-def _add_viirs_trends(df):
-    df = df.sort_values(["year", "month"]).reset_index(drop=True).copy()
-    if df.empty:
-        return df
-    months_id = df["year"].astype(int) * 12 + df["month"].astype(int)
-    contiguous = months_id.diff().eq(1)
-    valid = df["ntl_sum"].notna()
-    df["ntl_ma3"] = df["ntl_sum"].rolling(3, min_periods=3).mean().where(
-        contiguous & contiguous.shift(1, fill_value=False))
-    previous = df["ntl_sum"].shift()
-    df["ntl_mom_growth_pct"] = (100 * (df["ntl_sum"] / previous - 1)).where(
-        contiguous & valid & previous.notna() & previous.ne(0))
-    return df
-
-
-def _night_row(commune, paths, year, month, sensor, image_path, collection_id=None):
-    dmsp = sensor == "DMSP-OLS"
-    band = "stable_lights" if dmsp else "avg_rad"
-    scale = DMSP_SCALE if dmsp else VIIRS_SCALE
-    row = {**_admin(commune), "year": year, "month": np.nan if dmsp else month,
-           "date": f"{year}-01-01" if dmsp else f"{year}-{month:02d}-01",
-           "sensor": sensor, "temporal_resolution": "annual" if dmsp else "monthly",
-           "value_unit": "DN" if dmsp else "nW/cm²/sr", "source_band": band,
-           "source_collection": DMSP_ID if dmsp else collection_id, "scale_m": scale}
-    if image_path is not None:
-        raw = analyze_night_image(image_path, sensor, band, scale, get_night_lit_threshold(sensor))
-        if not raw:
-            return None
-        row["image_file"] = os.path.relpath(image_path, paths["commune_dir"])
-        row.update({target: raw.get(source, np.nan) for source, target in NIGHT_METRIC_MAP.items()})
-    return row
-
-def process_commune(gid):
-    _check_stop()
-    t0 = time.time()
-    commune = get_commune_info(gid)
-    paths = build_commune_paths(commune)
-    for key in ("img_dir", "img_dir_dmsp", "img_dir_viirs", "csv_dir"):
-        os.makedirs(paths[key], exist_ok=True)
-    osm, osm_ok = get_osm_cached(commune)
-
-    # ---- Ảnh ngày ----
-    day_rows, day_failed = [], 0
-    for y, m in ALL_MONTHS:
-        _check_stop()
-        planned_sensor, planned_collection, _ = assigned_day_source(y)
-        row = {**_admin(commune), **osm, "date": f"{y}-{m:02d}-01", "year": y, "month": m,
-               "sensor": planned_sensor, "source_collection": planned_collection,
-               "source_policy": DAY_SOURCE_POLICY}
         try:
-            path, sensor, n_scenes = download_month_image(commune["GID_3"], commune["geometry"], y, m,
-                                                           paths["img_dir"], paths["file_stem"])
-            if path is not None:
-                row.update({"sensor": sensor, "source_collection": DAY_SENSOR_COLLECTIONS[sensor],
-                            "source_policy": DAY_SOURCE_POLICY, "n_scenes": n_scenes,
-                            "image_file": os.path.relpath(path, paths["commune_dir"]),
-                            **analyze_image(path)})
-                day_rows.append(row)
-            else:
-                if n_scenes and n_scenes > 0:
-                    day_failed += 1
-                if KEEP_EMPTY_MONTHS:
-                    row.update({"n_scenes": 0, "image_file": ""}); day_rows.append(row)
-        except Exception as exc:
-            day_failed += 1
-            log.warning(f"[{gid}] Day {y}-{m:02d}: {exc}")
-            if KEEP_EMPTY_MONTHS:
-                day_rows.append(row)
-    day = _write_csv(day_rows, paths["csv_day"], DAY_COLUMNS)
-
-    # ---- DMSP theo năm (rỗng với 2024, vẫn ghi CSV để giữ cấu trúc) ----
-    dmsp_rows = []
-    for y in DMSP_YEARS:
-        _check_stop()
-        try:
-            path = download_dmsp_annual_image(commune["GID_3"], commune["geometry"], y,
-                                              paths["img_dir_dmsp"], paths["file_stem"])
-            if path is not None or KEEP_EMPTY_MONTHS:
-                r = _night_row(commune, paths, y, None, "DMSP-OLS", path)
-                if r is not None:
-                    dmsp_rows.append(r)
-        except Exception as exc:
-            log.warning(f"[{gid}] DMSP {y}: {exc}")
-    dmsp = _write_csv(dmsp_rows, paths["csv_dmsp"], NIGHT_COLUMNS)
-
-    # ---- VIIRS theo tháng ----
-    viirs_rows, viirs_failed = [], 0
-    for y, m in VIIRS_MONTHS:
-        _check_stop()
-        try:
-            path, collection_id = download_viirs_month_image(commune["GID_3"], commune["geometry"], y, m,
-                                                             paths["img_dir_viirs"], paths["file_stem"])
-            if path is None and collection_id is not None:
-                viirs_failed += 1
-            if path is not None or KEEP_EMPTY_MONTHS:
-                r = _night_row(commune, paths, y, m, "VIIRS", path, collection_id)
-                if r is not None:
-                    viirs_rows.append(r)
-        except Exception as exc:
-            viirs_failed += 1
-            log.warning(f"[{gid}] VIIRS {y}-{m:02d}: {exc}")
-    viirs = _write_csv(_add_viirs_trends(pd.DataFrame(viirs_rows).reindex(columns=NIGHT_COLUMNS)),
-                       paths["csv_viirs"], NIGHT_COLUMNS)
-
-    # ---- Night_All ----
-    frames = [f for f in (dmsp, viirs) if not f.empty]
-    night = (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()).reindex(columns=NIGHT_COLUMNS)
-    if not night.empty:
-        night = night.sort_values(["year", "month", "sensor"], na_position="first").reset_index(drop=True)
-    _write_csv(night, paths["csv_night"], NIGHT_COLUMNS)
-
-    push_commune(paths)          # Colab/path: chép ngay; rclone: luồng nền tự đẩy
-    complete = day_failed == 0 and viirs_failed == 0 and osm_ok
-    return {
-        "gid_3": gid, "status": "done" if complete else "partial",
-        "name_1": commune["NAME_1"], "name_3": commune["NAME_3"], "rel_dir": paths["rel_dir"],
-        "day_rows": len(day), "day_failed": day_failed,
-        "viirs_rows": len(viirs), "viirs_failed": viirs_failed, "osm_ok": osm_ok,
-        "seconds": round(time.time() - t0, 1),
-        "finished_at": datetime.now().isoformat(timespec="seconds"),
-    }
-
-import subprocess
-
-_status_lock = threading.Lock()
+            r = _http_get(url)
+        except requests.RequestException as exc:
+            last = f"mạng: {exc}"
+            time.sleep(5 * (attempt + 1))
+            continue
+        if r.status_code >= 400:
+            body = (r.text or "")[:400].replace("\n", " ")
+            msg = f"HTTP {r.status_code}: {body}"
+            kind = _classify(msg) if r.status_code not in (401, 403) else "permanent"
+            if kind == "too_large":
+                raise TooLargeError(msg)
+            if kind == "permanent":
+                raise PermanentError(msg)
+            last = msg
+            time.sleep(5 * (attempt + 1))
+            continue
+        data = r.content
+        if data[:2] == b"PK":                       # đôi khi EE trả về file zip (notebook cell 21)
+            z = zipfile.ZipFile(io.BytesIO(data))
+            data = z.read([n for n in z.namelist() if n.lower().endswith(".tif")][0])
+        if len(data) < 200:
+            last = f"file tải về chỉ {len(data)} byte"
+            time.sleep(5 * (attempt + 1))
+            continue
+        return data
+    raise RuntimeError(f"Tải thất bại sau {max_retry} lần: {last}")
 
 
-def _atomic_json(path, obj):
+def _grid_offset(a, b, res):
+    """Số pixel lệch giữa hai gốc tọa độ; phải là số nguyên nếu cùng lưới."""
+    k = (a - b) / res
+    if abs(k - round(k)) > 1e-3:
+        raise RuntimeError(f"Các ô ảnh không cùng lưới pixel (lệch {k:.4f} pixel). Không ghép để tránh sai giá trị.")
+    return int(round(k))
+
+
+def mosaic_tiles(tile_bytes_list):
+    """Ghép các ô GeoTIFF cùng lưới pixel thành một mảng. Không resample: chỉ đặt từng ô vào đúng vị trí."""
+    import rasterio
+    tiles = []
+    for data in tile_bytes_list:
+        with rasterio.MemoryFile(data) as mf, mf.open() as src:
+            tiles.append({"arr": src.read(), "tr": src.transform, "crs": src.crs, "nodata": src.nodata,
+                          "dtype": src.dtypes[0], "desc": src.descriptions, "h": src.height, "w": src.width})
+    t0 = tiles[0]
+    resx, resy = t0["tr"].a, t0["tr"].e
+    for t in tiles:
+        if abs(t["tr"].a - resx) > 1e-12 or abs(t["tr"].e - resy) > 1e-12 or t["dtype"] != t0["dtype"] \
+                or t["arr"].shape[0] != t0["arr"].shape[0]:
+            raise RuntimeError("Các ô ảnh khác độ phân giải, kiểu dữ liệu hoặc số kênh: không ghép.")
+    left = min(t["tr"].c for t in tiles)
+    top = max(t["tr"].f for t in tiles)
+    pos = []
+    for t in tiles:
+        col = _grid_offset(t["tr"].c, left, resx)
+        row = _grid_offset(t["tr"].f, top, resy)
+        pos.append((row, col))
+    H = max(r + t["h"] for (r, _c), t in zip(pos, tiles))
+    W = max(c + t["w"] for (_r, c), t in zip(pos, tiles))
+    fill = t0["nodata"] if t0["nodata"] is not None else 0
+    out = np.full((t0["arr"].shape[0], H, W), fill, dtype=t0["dtype"])
+    filled = np.zeros((H, W), dtype=bool)
+    for (r, c), t in zip(pos, tiles):
+        a = t["arr"]
+        if t["nodata"] is not None:
+            valid = ~np.all((a == t["nodata"]) | np.isnan(a) if np.issubdtype(a.dtype, np.floating)
+                            else (a == t["nodata"]), axis=0)
+        else:
+            valid = np.ones(a.shape[1:], dtype=bool)
+        sub = out[:, r:r + t["h"], c:c + t["w"]]
+        seen = filled[r:r + t["h"], c:c + t["w"]]
+        # Phần chồng lấn giữa hai ô phải có giá trị trùng nhau (cùng lưới, cùng ảnh)
+        both = seen & valid
+        if both.any() and not np.allclose(sub[:, both], a[:, both], equal_nan=True, rtol=0, atol=0):
+            raise RuntimeError("Phần chồng lấn giữa các ô ảnh không trùng giá trị: không ghép.")
+        write = valid | ~seen
+        sub[:, write] = a[:, write]
+        seen |= valid
+    from rasterio.transform import Affine
+    transform = Affine(resx, 0, left, 0, resy, top)
+    return out, transform, t0["crs"], t0["nodata"], t0["desc"]
+
+
+def compare_on_grid(a_ref, tr_ref, a_new, tr_new):
+    """a_new phải cùng lưới với a_ref, trùng giá trị ở phần chung, phần thừa (nếu có) chỉ là NoData/0."""
+    if abs(tr_ref.a - tr_new.a) > 1e-12 or abs(tr_ref.e - tr_new.e) > 1e-12:
+        raise RuntimeError("khác kích thước pixel")
+    c = _grid_offset(tr_ref.c, tr_new.c, tr_new.a)
+    r = _grid_offset(tr_ref.f, tr_new.f, tr_new.e)
+    if r < 0 or c < 0 or r + a_ref.shape[1] > a_new.shape[1] or c + a_ref.shape[2] > a_new.shape[2]:
+        raise RuntimeError(f"ảnh ghép không phủ hết ảnh gốc (lệch {r},{c})")
+    win = a_new[:, r:r + a_ref.shape[1], c:c + a_ref.shape[2]]
+    if not np.array_equal(win, a_ref, equal_nan=True):
+        raise RuntimeError("giá trị pixel khác nhau ở phần chung")
+    extra = np.ones(a_new.shape[1:], dtype=bool)
+    extra[r:r + a_ref.shape[1], c:c + a_ref.shape[2]] = False
+    if extra.any():
+        e = a_new[:, extra]
+        if np.any(np.nan_to_num(e, nan=0.0) != 0):
+            raise RuntimeError("phần viền thừa có giá trị khác NoData")
+    return True
+
+
+def write_tif(path, arr, transform, crs, nodata, desc):
+    import rasterio
+    profile = {"driver": "GTiff", "height": arr.shape[1], "width": arr.shape[2], "count": arr.shape[0],
+               "dtype": arr.dtype, "crs": crs, "transform": transform, "nodata": nodata}
+    if COMPRESS_TIF:
+        profile.update(compress="DEFLATE", predictor=3 if np.issubdtype(arr.dtype, np.floating) else 2,
+                       tiled=True, blockxsize=256, blockysize=256)
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(arr)
+        for i, d in enumerate(desc or [], start=1):
+            if d:
+                dst.set_band_description(i, d)
+
+
+def _rewrite_bytes_to_tif(data, path):
+    import rasterio
+    with rasterio.MemoryFile(data) as mf, mf.open() as src:
+        arr, tr, crs, nd, desc = src.read(), src.transform, src.crs, src.nodata, src.descriptions
+    write_tif(path, arr, tr, crs, nd, desc)
+
+
+def _bbox(region):
+    coords = region.bounds(maxError=1).getInfo()["coordinates"][0]
+    xs, ys = [c[0] for c in coords], [c[1] for c in coords]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _split_bbox(bbox, n):
+    x0, y0, x1, y1 = bbox
+    dx, dy = (x1 - x0) / n, (y1 - y0) / n
+    return [ee.Geometry.Rectangle([x0 + i * dx, y0 + j * dy, x0 + (i + 1) * dx, y0 + (j + 1) * dy],
+                                  "EPSG:4326", False)
+            for j in range(n) for i in range(n)]
+
+
+def download_tif(img, region, scale, path, label, force_tiles=0):
+    """Tải ảnh về `path`. Nếu vượt hạn mức thì chia ô (cùng scale, cùng lưới) rồi ghép.
+    Trả số ô đã dùng (1 = tải nguyên). Mọi thất bại đều được ném ra kèm nguyên nhân."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".part"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, default=lambda o: None if pd.isna(o) else str(o))
-    os.replace(tmp, path)
+    try:
+        if not force_tiles:
+            try:
+                data = fetch_geotiff_bytes(img, region, scale)
+                _rewrite_bytes_to_tif(data, tmp)
+                os.replace(tmp, path)
+                _dl_record(True)
+                return 1
+            except TooLargeError as exc:
+                m = re.search(r"\((\d+)\s*bytes\)", str(exc))
+                ratio = (int(m.group(1)) / 50331648) if m else 4
+                n = max(2, math.ceil(math.sqrt(ratio * 1.3)))
+                log.info(f"{label}: vượt hạn mức tải, chia {n}x{n} ô (giữ nguyên scale={scale})")
+        else:
+            n = force_tiles
+        if not TILING_OK[0]:
+            raise RuntimeError(f"{label}: ảnh vượt hạn mức tải nhưng bước kiểm tra chia ô ở preflight không đạt, "
+                               f"nên không ghép ô để tránh sai lưới pixel. Xã này cần xử lý riêng.")
+        bbox = _bbox(region)
+        while n <= MAX_TILE_SPLIT:
+            try:
+                parts = [fetch_geotiff_bytes(img, rect, scale) for rect in _split_bbox(bbox, n)]
+                arr, tr, crs, nd, desc = mosaic_tiles(parts)
+                write_tif(tmp, arr, tr, crs, nd, desc)
+                os.replace(tmp, path)
+                _dl_record(True)
+                return n * n
+            except TooLargeError:
+                n += 1
+                log.info(f"{label}: ô vẫn quá lớn, tăng lên {n}x{n}")
+        raise RuntimeError(f"{label}: vẫn vượt hạn mức khi đã chia {MAX_TILE_SPLIT}x{MAX_TILE_SPLIT} ô")
+    except StopRequested:
+        raise
+    except Exception as exc:
+        _dl_record(False, exc)
+        raise
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
-def write_status(gid, info):
-    """Nối một dòng vào file của lượt hiện tại."""
-    line = json.dumps(info, ensure_ascii=False, default=lambda o: None if pd.isna(o) else str(o))
+def inspect_tif(path, expect_bands):
+    """Đọc lại file vừa ghi. Trả (ok, empty, ghi_chú)."""
+    import rasterio
+    try:
+        with rasterio.open(path) as src:
+            if src.count != expect_bands:
+                return False, False, f"có {src.count} kênh, cần {expect_bands}"
+            if src.crs is None or src.crs.to_epsg() != 4326:
+                return False, False, f"CRS {src.crs}"
+            a = src.read(1, masked=True)
+            if np.issubdtype(a.dtype, np.floating):
+                a = np.ma.masked_invalid(a)
+            empty = a.count() == 0 or not np.any(a.filled(0) != 0)
+            return True, bool(empty), ""
+    except Exception as exc:
+        return False, False, f"không đọc được: {exc}"
+
+
+# =====================================================================================
+# 7. XỬ LÝ MỘT XÃ
+# =====================================================================================
+class NotInAsset(RuntimeError):
+    pass
+
+
+def _write_csv(df, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path + ".part", index=False, encoding="utf-8-sig")
+    os.replace(path + ".part", path)
+
+
+ADMIN_DF = None      # bảng hành chính GADM (vai trò gdf_cleaned trong notebook)
+
+
+def process_commune(row, prev):
+    """prev: bản ghi trạng thái lần trước (để chạy tiếp phần còn thiếu, không làm lại phần đã xong)."""
+    check_stop()
+    t_start = time.time()
+    ctx = build_ctx(row)
+    gid3 = ctx["gid3"]
+    prev = prev or {}
+    info = {"gid_3": gid3, "gid_1": ctx["gid1"], "run_id": RUN_ID,
+            "t1": prev.get("t1", "pending"),
+            "t2": dict(prev.get("t2") or {}), "t3img": dict(prev.get("t3img") or {}),
+            "t3csv": prev.get("t3csv", "pending"),
+            "empty_months_t2": prev.get("empty_months_t2", []), "tiles_used": prev.get("tiles_used", {}),
+            "errors": []}
+
+    fc = communes_fc.filter(ee.Filter.eq("GID_3", gid3))
+    if fc.size().getInfo() == 0:
+        raise NotInAsset(f"GID_3 {gid3} không có trong asset {ASSET_ID}")
+    commune_geom = fc.geometry()
+
+    # ---------- Task 1 ----------
+    if info["t1"] != "ok":
+        try:
+            t1_monthly = []
+            for m in MONTHS:
+                check_stop()
+                df_result = export_province_s2_local(
+                    province_gid=ctx["gid1"], province_name=ctx["name1"], year=YEAR, month=m,
+                    save_dir=None, gdf_admin=ADMIN_DF, commune_gid=gid3)
+                if df_result is not None:
+                    t1_monthly.append(df_result.assign(YEAR=YEAR, MONTH=m))
+            if not t1_monthly:
+                raise RuntimeError("Task 1: không tháng nào có cảnh Sentinel-2")
+            df_t1_year = pd.concat(t1_monthly, ignore_index=True)
+            if df_t1_year.empty:
+                raise RuntimeError("Task 1: kết quả rỗng (GID_3 không khớp bảng GADM?)")
+            _write_csv(df_t1_year, L(ctx["rel_t1"]))
+            info["t1"] = "ok"
+            info["t1_months"] = int(len(df_t1_year))
+        except StopRequested:
+            raise
+        except Exception as exc:
+            info["t1"] = "fail"
+            info["errors"].append(f"T1: {type(exc).__name__}: {str(exc)[:200]}")
+            if isinstance(exc, PermanentError):
+                raise
+
+    # ---------- Task 2 ----------
+    for m in MONTHS:
+        key = f"{m:02d}"
+        if info["t2"].get(key) in ("ok", "none"):
+            continue
+        check_stop()
+        try:
+            collection_id = "COPERNICUS/S2_SR_HARMONIZED" if YEAR >= 2019 else "COPERNICUS/S2_HARMONIZED"
+            composite = get_adaptive_monthly_composite(YEAR, m, commune_geom, collection_id)
+            if composite is None:
+                info["t2"][key] = "none"           # notebook: "Bỏ qua tháng: không tìm thấy ảnh"
+                continue
+            export_img = add_indices(composite).clip(commune_geom)
+            path = L(ctx["rel_t2_dir"], t2_name(ctx, YEAR, m))
+            n = download_tif(export_img, commune_geom, 20, path, f"[{gid3}] T2 {YEAR}-{key}")
+            ok, empty, note = inspect_tif(path, 10)
+            if not ok:
+                raise RuntimeError(f"file kiểm tra lỗi: {note}")
+            if empty and key not in info["empty_months_t2"]:
+                info["empty_months_t2"].append(key)
+            if n > 1:
+                info["tiles_used"][f"t2_{key}"] = n
+            info["t2"][key] = "ok"
+        except StopRequested:
+            raise
+        except PermanentError:
+            raise
+        except Exception as exc:
+            info["t2"][key] = "fail"
+            info["errors"].append(f"T2 {key}: {type(exc).__name__}: {str(exc)[:200]}")
+
+    # ---------- Task 3.1 ----------
+    for m in MONTHS:
+        key = f"{m:02d}"
+        if info["t3img"].get(key) in ("ok", "none"):
+            continue
+        check_stop()
+        try:
+            night_img = get_viirs_monthly_composite(YEAR, m, commune_geom)
+            if night_img is None:
+                info["t3img"][key] = "none"
+                continue
+            path = L(ctx["rel_t3_dir"], t3_name(ctx, YEAR, m))
+            download_tif(night_img.toDouble(), commune_geom, 500, path, f"[{gid3}] T3 {YEAR}-{key}")
+            ok, _empty, note = inspect_tif(path, 2)
+            if not ok:
+                raise RuntimeError(f"file kiểm tra lỗi: {note}")
+            info["t3img"][key] = "ok"
+        except StopRequested:
+            raise
+        except PermanentError:
+            raise
+        except Exception as exc:
+            info["t3img"][key] = "fail"
+            info["errors"].append(f"T3img {key}: {type(exc).__name__}: {str(exc)[:200]}")
+
+    # ---------- Task 3.2 ----------
+    if info["t3csv"] != "ok":
+        try:
+            df_ntl = compute_ntl_indices(commune_geom, ctx["gid1"], ctx["name1"], gid3, ctx["cname_full"])
+            _write_csv(df_ntl, L(ctx["rel_t3csv"]))
+            info["t3csv"] = "ok"
+            info["t3_months"] = int(len(df_ntl))
+        except StopRequested:
+            raise
+        except Exception as exc:
+            info["t3csv"] = "fail"
+            info["errors"].append(f"T3csv: {type(exc).__name__}: {str(exc)[:200]}")
+
+    core_ok = (info["t1"] == "ok" and info["t3csv"] == "ok"
+               and all(info["t2"].get(f"{m:02d}") in ("ok", "none") for m in MONTHS)
+               and all(info["t3img"].get(f"{m:02d}") in ("ok", "none") for m in MONTHS))
+    info["status"] = "done" if core_ok else "partial"
+    info["seconds"] = round(time.time() - t_start, 1)
+    info["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return info
+
+
+# =====================================================================================
+# 8. TRẠNG THÁI (mỗi lượt một file .jsonl trong _control/status, bản ghi sau cùng thắng)
+# =====================================================================================
+_status_lock = threading.Lock()
+STATUS_FILE = None
+
+
+def write_status(info):
+    line = json.dumps(info, ensure_ascii=False, default=str)
     with _status_lock:
-        os.makedirs(LEASE_DIR, exist_ok=True)
-        with open(LEASE_FILE, "a", encoding="utf-8") as f:
+        os.makedirs(L(D_STATUS), exist_ok=True)
+        with open(STATUS_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
 
 def load_all_status():
-    """Phát lại mọi lượt theo thứ tự thời gian; bản ghi sau cùng của mỗi xã thắng.
-    Dòng cụt (file đang được ghi dở khi đồng bộ) bị bỏ qua."""
     out = {}
-    for p in sorted(glob.glob(os.path.join(LEASE_DIR, "lease_*.jsonl"))):
+    for p in sorted(glob.glob(L(D_STATUS, "status_*.jsonl"))):
         try:
             with open(p, encoding="utf-8") as f:
                 for line in f:
@@ -1068,74 +1008,49 @@ def load_all_status():
     return out
 
 
-def is_finished(st):
-    return bool(st) and (st.get("status") == "done" or int(st.get("attempts", 0)) >= MAX_ATTEMPTS)
+def core_finished(st):
+    return bool(st) and (st.get("status") == "done" or st.get("status") == "not_in_asset"
+                         or int(st.get("attempts", 0)) >= MAX_ATTEMPTS)
 
 
-# ---------------- Chế độ Colab / path: chép từng xã ----------------
-def _copy_tree(src_dir, dst_dir):
-    for cur, _dirs, files in os.walk(src_dir):
-        rel = os.path.relpath(cur, src_dir)
-        tdir = dst_dir if rel == "." else os.path.join(dst_dir, rel)
-        os.makedirs(tdir, exist_ok=True)
-        for name in files:
-            if name.endswith(".part") or (name.endswith(".json") and not UPLOAD_SIDECAR_JSON):
-                continue
-            s, t = os.path.join(cur, name), os.path.join(tdir, name)
-            if name.lower().endswith(".tif") and os.path.isfile(t) and os.path.getsize(t) == os.path.getsize(s):
-                continue
-            shutil.copy2(s, t)
 
-
-def _drop_local_tifs(commune_dir):
-    for p in glob.glob(os.path.join(commune_dir, "**", "*.tif"), recursive=True):
-        os.remove(p)
-        if os.path.exists(p + ".json"):
-            os.remove(p + ".json")
-
-
-def push_commune(paths):
-    if STORAGE_MODE == "rclone":
-        return
-    _copy_tree(paths["commune_dir"], os.path.join(DEST_BASE, paths["rel_dir"]))
-    if not KEEP_LOCAL_TIF:
-        _drop_local_tifs(paths["commune_dir"])
-
-
-# ---------------- Chế độ rclone: luồng nền ----------------
-REMOTE_BASE = f"{RCLONE_REMOTE}:{DRIVE_FOLDER_NAME}"
+# =====================================================================================
+# 9. RCLONE
+# =====================================================================================
 RCLONE_COMMON = ["--transfers", "4", "--checkers", "8", "--tpslimit", "8",
                  "--retries", "5", "--low-level-retries", "20", "--stats-log-level", "NOTICE"]
 
 
-def _rclone(args, timeout=6 * 3600):
-    res = subprocess.run(["rclone", *args], capture_output=True, text=True, timeout=timeout)
-    if res.returncode != 0:
+def _rclone(args, timeout=6 * 3600, quiet=False):
+    try:
+        res = subprocess.run(["rclone", *args], capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:
+        log.warning(f"rclone {' '.join(args[:2])} lỗi: {exc}")
+        return False
+    if res.returncode != 0 and not quiet:
         log.warning(f"rclone {' '.join(args[:3])} lỗi: {res.stderr.strip()[-400:]}")
     return res.returncode == 0
 
 
+_sync_lock = threading.Lock()
+
+
 def rclone_sync_once(final=False):
-    """TIF: chuyển lên Drive (xóa bản trên máy nếu KEEP_LOCAL_TIF=False). CSV, trạng thái, log: chép."""
-    prov_local = os.path.join(LOCAL_ROOT, SUB_PROV)
-    if os.path.isdir(prov_local):
-        verb = "copy" if KEEP_LOCAL_TIF else "move"
-        tif_filters = ["--filter", "- *.part", "--filter", "+ *.tif", "--filter", "- *"]
+    """TIF: move (rclone chỉ xóa bản trên máy sau khi đã kiểm tra kích thước/hash bản trên Drive).
+    CSV, trạng thái, log: copy."""
+    if not os.path.isdir(LOCAL_ROOT):
+        return
+    with _sync_lock:
         age = [] if final else ["--min-age", "2m"]
-        _rclone([verb, prov_local, f"{REMOTE_BASE}/{SUB_PROV}", *tif_filters, *age, *RCLONE_COMMON])
-        csv_filters = ["--filter", "- *.part", "--filter", "+ *.csv"]
-        if UPLOAD_SIDECAR_JSON:
-            csv_filters += ["--filter", "+ *.json"]
-        csv_filters += ["--filter", "- *"]
-        _rclone(["copy", prov_local, f"{REMOTE_BASE}/{SUB_PROV}", *csv_filters,
-                 "--create-empty-src-dirs", *RCLONE_COMMON])
-    for sub in (SUB_INDEX, SUB_COMBINED, SUB_STATUS, SUB_LOGS):
-        src = os.path.join(LOCAL_ROOT, sub)
-        if os.path.isdir(src):
-            _rclone(["copy", src, f"{REMOTE_BASE}/{sub}", "--filter", "- *.part", *RCLONE_COMMON])
-    readme = os.path.join(LOCAL_ROOT, SUB_README)
-    if os.path.isfile(readme):
-        _rclone(["copyto", readme, f"{REMOTE_BASE}/{SUB_README}"])
+        for d in (D_T2, D_T3IMG):
+            src = L(d)
+            if os.path.isdir(src):
+                _rclone(["move", src, f"{REMOTE_BASE}/{d}", "--filter", "- *.part", "--filter", "+ *.tif",
+                         "--filter", "- *", *age, *RCLONE_COMMON])
+        for d in (D_T1, D_T3CSV, D_MERGED, D_CONTROL):
+            src = L(d)
+            if os.path.isdir(src):
+                _rclone(["copy", src, f"{REMOTE_BASE}/{d}", "--filter", "- *.part", *RCLONE_COMMON])
 
 
 class Uploader(threading.Thread):
@@ -1144,265 +1059,446 @@ class Uploader(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
-        while not self.stop_event.wait(UPLOAD_EVERY_SEC):
-            try:
-                rclone_sync_once()
-                log.info("Đã đồng bộ lên Drive (lượt định kỳ).")
-            except Exception as exc:
-                log.warning(f"Đồng bộ định kỳ lỗi: {exc}")
+        last_stop_check = 0
+        while not self.stop_event.wait(min(UPLOAD_EVERY_SEC, 60)):
+            now = time.time()
+            if now - last_stop_check >= DRIVE_STOP_POLL_SEC:
+                last_stop_check = now
+                if drive_stop_exists():
+                    request_stop("drive_stop")
+            if now - getattr(self, "_last_sync", 0) >= UPLOAD_EVERY_SEC:
+                self._last_sync = now
+                try:
+                    rclone_sync_once()
+                    log.info("Đã đồng bộ lên Drive (định kỳ).")
+                except Exception as exc:
+                    log.warning(f"Đồng bộ định kỳ lỗi: {exc}")
 
 
-def mount_drive_if_colab():
-    """Phải chạy TRƯỚC khi tạo bất kỳ thư mục nào dưới /content/drive."""
-    if STORAGE_MODE == "colab":
-        from google.colab import drive
-        if not os.path.isdir("/content/drive/MyDrive"):
-            drive.mount("/content/drive")
-        os.makedirs(DEST_BASE, exist_ok=True)
+def drive_stop_exists():
+    try:
+        res = subprocess.run(["rclone", "lsf", f"{REMOTE_BASE}/{D_CONTROL}", "--files-only"],
+                             capture_output=True, text=True, timeout=120)
+        return res.returncode == 0 and "STOP" in [x.strip() for x in res.stdout.splitlines()]
+    except Exception:
+        return False
 
 
 def init_storage():
-    for d in (LOCAL_ROOT, WORK_PROV_ROOT, os.path.join(META_ROOT, SUB_INDEX),
-              os.path.join(META_ROOT, SUB_COMBINED), LEASE_DIR, OSM_CACHE_DIR, LOG_DIR):
+    for d in (LOCAL_ROOT, L(D_STATUS), L(D_LOGS), CACHE_DIR):
         os.makedirs(d, exist_ok=True)
-    if STORAGE_MODE == "rclone":
-        if shutil.which("rclone") is None:
-            raise RuntimeError("Chưa cài rclone. Xem hướng dẫn ở ô cuối notebook.")
-        if not _rclone(["lsd", f"{RCLONE_REMOTE}:"], timeout=120):
-            raise RuntimeError(f"rclone chưa kết nối được remote '{RCLONE_REMOTE}'. Chạy `rclone config`.")
-        _rclone(["mkdir", REMOTE_BASE], timeout=120)
-        # Kéo trạng thái từ Drive về: máy ảo mới vẫn biết xã nào đã xong.
-        res = subprocess.run(["rclone", "copy", f"{REMOTE_BASE}/{SUB_STATUS}/leases", LEASE_DIR,
-                              "--update", "--retries", "1"],
-                             capture_output=True, text=True, timeout=3600)
-        if res.returncode == 0:
-            log.info(f"Đã kéo trạng thái từ Drive về máy: {len(load_all_status()):,} xã có bản ghi.")
-        elif "directory not found" in res.stderr:
-            log.info("Drive chưa có trạng thái: bắt đầu lần chạy mới.")
-        else:
-            log.warning(f"Không kéo được trạng thái từ Drive: {res.stderr.strip()[-300:]}")
-    with open(os.path.join(META_ROOT, SUB_README), "w", encoding="utf-8") as f:
-        f.write(README_TEXT)
+    if shutil.which("rclone") is None:
+        raise RuntimeError("Chưa cài rclone.")
+    if not _rclone(["mkdir", f"{REMOTE_BASE}/{D_STATUS}"], timeout=180):
+        raise RuntimeError(f"rclone không ghi được vào '{REMOTE_BASE}'. Kiểm tra secret RCLONE_CONF.")
+    res = subprocess.run(["rclone", "copy", f"{REMOTE_BASE}/{D_STATUS}", L(D_STATUS), "--update"],
+                         capture_output=True, text=True, timeout=3600)
+    if res.returncode != 0:
+        raise RuntimeError(f"Không kéo được trạng thái từ Drive: {res.stderr.strip()[-300:]}")
+    # Cảnh báo nếu đích còn cấu trúc của bản pipeline cũ
+    old = subprocess.run(["rclone", "lsf", REMOTE_BASE, "--dirs-only"], capture_output=True, text=True, timeout=120)
+    if any(x.strip("/") in ("03_Provinces", "04_Status", "01_Index") for x in old.stdout.splitlines()):
+        log.warning(f"Thư mục '{DRIVE_FOLDER}' trên Drive còn dữ liệu của bản pipeline cũ (03_Provinces, 04_Status...). "
+                    f"Nên xóa thư mục cũ rồi chạy lại để không lẫn dữ liệu.")
+
+
+# =====================================================================================
+# 10. DANH SÁCH XÃ (GADM 4.1, giống notebook cell 3)
+# =====================================================================================
+def build_admin_table():
+    idx_csv = os.path.join(CACHE_DIR, "gadm41_VNM_3_admin.csv")
+    if os.path.isfile(idx_csv):
+        return pd.read_csv(idx_csv, dtype=str, keep_default_na=False)
+    import geopandas as gpd
+    zip_path = os.path.join(CACHE_DIR, "gadm41_VNM_shp.zip")
+    ext = os.path.join(CACHE_DIR, "gadm41_VNM")
+    if not os.path.isfile(os.path.join(ext, "gadm41_VNM_3.shp")):
+        if not os.path.isfile(zip_path):
+            log.info("Tải ranh giới GADM 4.1...")
+            r = requests.get(GADM_VNM_URL, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=900)
+            r.raise_for_status()
+            with open(zip_path + ".part", "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(zip_path + ".part", zip_path)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(ext)
+    g = gpd.read_file(os.path.join(ext, "gadm41_VNM_3.shp"))
+    tbl = pd.DataFrame(g[ADM_COLS]).astype(str).drop_duplicates("GID_3")
+    tbl.to_csv(idx_csv, index=False, encoding="utf-8-sig")
+    return pd.read_csv(idx_csv, dtype=str, keep_default_na=False)
+
+
+def natural_sort_key(gid_str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(gid_str))]
+
+
+def load_targets(admin):
+    """Không chọn tỉnh, xã bằng tay. full: mọi xã. pilot: tự lấy PILOT_N xã đầu tiên theo thứ tự mã,
+    xen kẽ phường (đô thị) và xã (nông thôn) để thử cả hai loại; thiếu loại nào thì lấy bù theo thứ tự."""
+    df = admin.iloc[sorted(range(len(admin)), key=lambda i: natural_sort_key(admin.iloc[i]["GID_3"]))]
+    df = df.reset_index(drop=True)
+    if MODE == "full":
+        return df
+    t = df["TYPE_3"].str.strip().str.lower()
+    pools = [list(df.index[t == "phường"]), list(df.index[t == "xã"])]
+    picks = []
+    while len(picks) < PILOT_N and any(pools):
+        for pool in pools:
+            if pool and len(picks) < PILOT_N:
+                picks.append(pool.pop(0))
+    for k in df.index:
+        if len(picks) >= PILOT_N:
+            break
+        if k not in picks:
+            picks.append(k)
+    return df.loc[sorted(picks[:PILOT_N])].reset_index(drop=True)
+
+
+# =====================================================================================
+# 11. PREFLIGHT
+# =====================================================================================
+class PreflightError(RuntimeError):
+    pass
+
+
+PREFLIGHT_HINT = (
+    "Gợi ý: (1) HTTP 401/403 hoặc 'permission': cấp role 'Earth Engine Resource Writer' (roles/earthengine.writer) "
+    "và 'Service Usage Consumer' (roles/serviceusage.serviceUsageConsumer) cho service account, đăng ký project "
+    "với Earth Engine; (2) thử VNGIS_EE_HIGH_VOLUME=true nếu standard bị chặn; (3) lỗi rclone: kiểm tra RCLONE_CONF.")
+
+
+def preflight(row):
+    gid3 = row["GID_3"]
+    log.info(f"[preflight] 1/4 Asset ranh giới: {ASSET_ID}")
+    fc = communes_fc.filter(ee.Filter.eq("GID_3", gid3))
+    n = fc.size().getInfo()
+    if n == 0:
+        raise PreflightError(f"Asset không có xã {gid3}. Kiểm tra GID_3 trong asset có khớp GADM 4.1 không.")
+    geom = fc.geometry()
+    region = geom.centroid(maxError=1).buffer(1500)
+
+    log.info(f"[preflight] 2/4 Tải thử ảnh ngày Sentinel-2 (xã {gid3}, vùng nhỏ quanh tâm xã)")
+    comp = None
+    for m in MONTHS:
+        comp = get_adaptive_monthly_composite(YEAR, m, geom, "COPERNICUS/S2_SR_HARMONIZED")
+        if comp is not None:
+            break
+    if comp is None:
+        raise PreflightError("Không tìm thấy ảnh Sentinel-2 nào cho xã thử.")
+    img = add_indices(comp).clip(region)
+    try:
+        whole = fetch_geotiff_bytes(img, region, 20)
+    except Exception as exc:
+        raise PreflightError(f"Tải ảnh ngày thất bại: {exc}")
+    import rasterio
+    with rasterio.MemoryFile(whole) as mf, mf.open() as src:
+        if src.count != 10:
+            raise PreflightError(f"Ảnh ngày có {src.count} kênh, cần 10.")
+        a_whole, tr_whole = src.read(), src.transform
+    log.info(f"[preflight] Ảnh ngày OK: {len(whole)/1024:.0f} KB, 10 kênh, pixel {tr_whole.a:.8f} độ")
+
+    log.info("[preflight] 3/4 Kiểm tra cách chia ô (ảnh lớn) cho ra đúng lưới pixel như tải nguyên")
+    try:
+        parts = [fetch_geotiff_bytes(img, rect, 20) for rect in _split_bbox(_bbox(region), 2)]
+        a_tiled, tr_tiled, *_ = mosaic_tiles(parts)
+        compare_on_grid(a_whole, tr_whole, a_tiled, tr_tiled)
+        log.info("[preflight] Chia ô OK: ảnh ghép trùng khớp từng pixel với ảnh tải nguyên.")
+    except Exception as exc:
+        TILING_OK[0] = False
+        log.error(f"[preflight] Kiểm tra chia ô KHÔNG ĐẠT ({exc}). Pipeline vẫn chạy; xã nào quá lớn cần chia ô "
+                  f"sẽ được đánh dấu lỗi thay vì ghép sai.")
+
+    vimg = get_viirs_monthly_composite(YEAR, 1, geom)
+    if vimg is None:
+        raise PreflightError("Không có ảnh VIIRS tháng 01/2024.")
+    try:
+        nb = fetch_geotiff_bytes(vimg.toDouble().clip(region), region, 500)
+    except Exception as exc:
+        raise PreflightError(f"Tải ảnh đêm thất bại: {exc}")
+    log.info(f"[preflight] Ảnh đêm OK: {len(nb)/1024:.0f} KB")
+
+    log.info("[preflight] 4/4 Ghi và đọc lại file thử trên Drive")
+    probe = L(D_CONTROL, "preflight_probe.txt")
+    stamp = f"{RUN_ID} {datetime.now(timezone.utc).isoformat()}"
+    with open(probe, "w", encoding="utf-8") as f:
+        f.write(stamp)
+    if not _rclone(["copyto", probe, f"{REMOTE_BASE}/{D_CONTROL}/preflight_probe.txt"], timeout=300):
+        raise PreflightError("rclone không ghi được lên Drive.")
+    res = subprocess.run(["rclone", "cat", f"{REMOTE_BASE}/{D_CONTROL}/preflight_probe.txt"],
+                         capture_output=True, text=True, timeout=300)
+    if res.returncode != 0 or res.stdout.strip() != stamp:
+        raise PreflightError(f"Đọc lại file thử trên Drive không khớp: {res.stderr.strip()[-200:]}")
+    log.info("[preflight] ĐẠT: Earth Engine, quyền tải ảnh, chia ô và Google Drive đều hoạt động.")
+
+
+# =====================================================================================
+# 12. GỘP CSV
+# =====================================================================================
+INT_COLS = ("YEAR", "MONTH", "LIT_PIXELS")
+
+
+def _read_many(pattern):
+    frames = []
+    for p in sorted(glob.glob(pattern, recursive=True)):
+        try:
+            f = pd.read_csv(p, dtype={c: str for c in ADM_COLS}, keep_default_na=True)
+            if not f.empty:
+                frames.append(f)
+        except Exception as exc:
+            log.warning(f"Không đọc được {p}: {exc}")
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    for c in INT_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    return df
+
+
+def build_merged(pull=True):
+    if pull:
+        for d in (D_T1, D_T3CSV):
+            _rclone(["copy", f"{REMOTE_BASE}/{d}", L(d), "--filter", "+ *.csv", "--filter", "- *", *RCLONE_COMMON])
+    specs = [(D_T1, "Task1_Spectral_Indices"), (D_T3CSV, "Task3_Economic_Indices")]
+    out_dir = L(D_MERGED)
+    os.makedirs(os.path.join(out_dir, "by_province"), exist_ok=True)
+    for d, name in specs:
+        df = _read_many(L(d, "**", "*.csv"))
+        if df.empty:
+            continue
+        _write_csv(df, os.path.join(out_dir, f"{name}_{YEAR}_ALL.csv"))
+        for gid1, part in df.groupby("GID_1"):
+            _write_csv(part, os.path.join(out_dir, "by_province", f"{name}_{gid1}.csv"))
+        log.info(f"Gộp {name}: {len(df):,} dòng")
+
 
 def write_progress(targets, statuses):
     rows = []
     for r in targets.itertuples():
         st = statuses.get(r.GID_3) or {}
-        rows.append({"GID_1": r.GID_1, "NAME_1": r.NAME_1, "GID_2": r.GID_2, "NAME_2": r.NAME_2,
-                     "GID_3": r.GID_3, "NAME_3": r.NAME_3, "TYPE_3": r.TYPE_3,
+        t2 = st.get("t2") or {}
+        t3 = st.get("t3img") or {}
+        rows.append({"GID_1": r.GID_1, "NAME_1": r.NAME_1, "GID_3": r.GID_3, "NAME_3": r.NAME_3,
                      "status": st.get("status", "pending"), "attempts": st.get("attempts", 0),
-                     "day_rows": st.get("day_rows"), "day_failed": st.get("day_failed"),
-                     "viirs_rows": st.get("viirs_rows"), "viirs_failed": st.get("viirs_failed"),
-                     "osm_ok": st.get("osm_ok"), "folder": st.get("rel_dir", ""),
+                     "t1": st.get("t1"), "t2_ok": sum(v == "ok" for v in t2.values()),
+                     "t2_none": sum(v == "none" for v in t2.values()),
+                     "t3img_ok": sum(v == "ok" for v in t3.values()), "t3csv": st.get("t3csv"),
                      "seconds": st.get("seconds"), "finished_at": st.get("finished_at"),
-                     "error": st.get("error", "")})
+                     "errors": " | ".join(st.get("errors") or [])[:500]})
     df = pd.DataFrame(rows)
-    for path in (os.path.join(META_ROOT, SUB_STATUS, "progress.csv"),
-                 os.path.join(META_ROOT, SUB_INDEX, f"commune_index_{YEAR}.csv")):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        df.to_csv(path + ".part", index=False, encoding="utf-8-sig")
-        os.replace(path + ".part", path)
+    _write_csv(df, L(D_CONTROL, "progress.csv"))
     return df
 
 
-COMBINED_SPECS = [  # (đuôi tên CSV của xã, tên file gộp, cột)
-    (f"_Day_Monthly_{DAY_SOURCE_POLICY}.csv", f"Day_Monthly_{DAY_SOURCE_POLICY}_{YEAR}_ALL.csv", "DAY"),
-    ("_Night_VIIRS_Monthly.csv", f"Night_VIIRS_Monthly_{YEAR}_ALL.csv", "NIGHT"),
-    ("_Night_DMSP_Annual.csv", f"Night_DMSP_Annual_{YEAR}_ALL.csv", "NIGHT"),
-    ("_Night_All.csv", f"Night_All_{YEAR}_ALL.csv", "NIGHT"),
-]
+# =====================================================================================
+# 13. VÒNG CHẠY
+# =====================================================================================
+OUTAGE_STREAK = 10
+OUTAGE_SLEEP_SEC = 900
+MAX_OUTAGES = 8
 
 
-def build_combined(statuses):
-    """Gộp CSV của mọi xã đã xử lý. Ưu tiên bản trên máy, thiếu thì đọc ở đích (Colab/path)."""
-    out_dir = os.path.join(META_ROOT, SUB_COMBINED)
-    os.makedirs(out_dir, exist_ok=True)
-    dirs = []
-    for st in statuses.values():
-        rel = st.get("rel_dir")
-        if not rel:
-            continue
-        local_csv = os.path.join(LOCAL_ROOT, rel, "CSV")
-        dest_csv = os.path.join(DEST_BASE, rel, "CSV") if DEST_BASE else None
-        dirs.append(local_csv if os.path.isdir(local_csv) else dest_csv)
-    for suffix, out_name, kind in COMBINED_SPECS:
-        cols = DAY_COLUMNS if kind == "DAY" else NIGHT_COLUMNS
-        frames = []
-        for d in dirs:
-            if not d or not os.path.isdir(d):
-                continue
-            for p in glob.glob(os.path.join(d, f"*{suffix}")):
-                try:
-                    f = pd.read_csv(p, dtype={"gid_3": str, "gid_2": str, "gid_1": str})
-                    if not f.empty:
-                        frames.append(f)
-                except Exception as exc:
-                    log.warning(f"Không đọc được {p}: {exc}")
-        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        df = df.reindex(columns=cols)
-        path = os.path.join(out_dir, out_name)
-        df.to_csv(path + ".part", index=False, encoding="utf-8-sig")
-        os.replace(path + ".part", path)
-        log.info(f"Gộp {out_name}: {len(df):,} dòng")
-
-OUTAGE_STREAK = 10          # số xã lỗi liên tiếp coi là sự cố chung
-OUTAGE_SLEEP_SEC = 900      # nghỉ 15 phút
-MAX_OUTAGES = 8             # quá 8 lần liên tiếp (~2 giờ) thì thoát mã 2
-
-
-def _fail_info(gid, exc, attempts):
-    return {"gid_3": gid, "status": "failed", "attempts": attempts,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
-            "finished_at": datetime.now().isoformat(timespec="seconds")}
-
-
-def run_round(todo, statuses, total_targets):
+def run_round(jobs, statuses):
+    """jobs: list (gid, row, kind)."""
     t0 = time.time()
     done_now = 0
-    pending_fail = []       # lỗi chưa ghi, chờ xem có phải sự cố chung không
-    handled = set()
+    pending_fail = []
     outage = False
     pool = ThreadPoolExecutor(max_workers=N_WORKERS, thread_name_prefix="w")
-    futures = {pool.submit(process_commune, gid): gid for gid in todo}
+    futures = {}
+    for gid, row, kind in jobs:
+        futures[pool.submit(process_commune, row, statuses.get(gid))] = (gid, kind)
+    handled = set()
 
     def consume(fut):
         nonlocal done_now
         handled.add(fut)
         if fut.cancelled():
             return
-        gid = futures[fut]
-        attempts = int((statuses.get(gid) or {}).get("attempts", 0)) + 1
+        gid, kind = futures[fut]
+        prev = statuses.get(gid) or {}
+        attempts = int(prev.get("attempts", 0)) + 1
         try:
             info = fut.result()
         except StopRequested:
-            return                                   # dừng có trật tự: không phải lỗi của xã
+            return
+        except NotInAsset as exc:
+            info = {"gid_3": gid, "status": "not_in_asset", "attempts": MAX_ATTEMPTS, "errors": [str(exc)],
+                    "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            statuses[gid] = info
+            write_status(info)
+            log.error(f"[{gid}] {exc}")
+            return
+        except PermanentError as exc:
+            log.error(f"[{gid}] lỗi quyền truy cập: {exc}")
+            _dl_record(False, exc)
+            pending_fail.append((gid, exc, attempts))
+            return
         except Exception as exc:
             pending_fail.append((gid, exc, attempts))
             log.warning(f"[{gid}] lỗi: {type(exc).__name__}: {str(exc)[:200]}")
             return
-        # Có một xã thành công: các lỗi đang chờ là lỗi riêng, ghi nhận và trừ lượt.
         for g, e, a in pending_fail:
-            statuses[g] = _fail_info(g, e, a); write_status(g, statuses[g])
+            statuses[g] = _fail_info(g, e, a, statuses.get(g))
+            write_status(statuses[g])
         pending_fail.clear()
         info["attempts"] = attempts
         statuses[gid] = info
-        write_status(gid, info)
+        write_status(info)
         done_now += 1
+        errs = f" | lỗi: {info['errors'][:2]}" if info.get("errors") else ""
+        t2 = info.get("t2") or {}
+        log.info(f"[{gid}] {kind} -> {info.get('status')} | T1={info.get('t1')} "
+                 f"T2={sum(v == 'ok' for v in t2.values())}/12 T3img={sum(v == 'ok' for v in (info.get('t3img') or {}).values())}/12 "
+                 f"T3csv={info.get('t3csv')} | {info.get('seconds', 0)}s | lần {attempts}{errs}")
         if done_now % 20 == 0:
-            finished = sum(is_finished(statuses.get(g)) for g in statuses)
             rate = done_now / max(time.time() - t0, 1)
-            eta_h = (len(todo) - done_now) / rate / 3600
-            log.info(f"{done_now}/{len(todo)} xã trong vòng | hoàn tất chung {finished}/{total_targets} "
-                     f"| {rate*3600:.0f} xã/giờ | còn khoảng {eta_h:.1f} giờ")
+            log.info(f"Tiến độ vòng: {done_now}/{len(jobs)} | {rate*3600:.0f} việc/giờ")
 
     try:
         for fut in as_completed(futures):
             consume(fut)
             if len(pending_fail) >= OUTAGE_STREAK:
-                log.error(f"{OUTAGE_STREAK} xã lỗi liên tiếp: nghi sự cố chung, tạm dừng vòng này.")
+                log.error(f"{OUTAGE_STREAK} xã lỗi liên tiếp: nghi sự cố chung, tạm dừng vòng.")
                 outage = True
                 break
     except BaseException:
         pool.shutdown(wait=False, cancel_futures=True)
         raise
-    pool.shutdown(wait=True, cancel_futures=True)    # chờ các xã đang chạy dở xong hoặc bỏ cuộc
-    for fut in futures:                              # ghi nốt kết quả của xã vừa kịp xong
+    pool.shutdown(wait=True, cancel_futures=True)
+    for fut in futures:
         if fut not in handled and fut.done():
             consume(fut)
     if outage:
-        return "outage"                              # lỗi trong sự cố chung không bị trừ lượt
+        return "outage"
     for g, e, a in pending_fail:
-        statuses[g] = _fail_info(g, e, a); write_status(g, statuses[g])
+        statuses[g] = _fail_info(g, e, a, statuses.get(g))
+        write_status(statuses[g])
     return "stop" if STOP_EVENT.is_set() else "ok"
 
 
+def _fail_info(gid, exc, attempts, prev):
+    info = dict(prev or {})
+    info.update({"gid_3": gid, "status": "failed", "attempts": attempts, "run_id": RUN_ID,
+                 "errors": [f"{type(exc).__name__}: {str(exc)[:300]}"],
+                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+    return info
+
+
 def main():
-    mount_drive_if_colab()
+    global STATUS_FILE, ADMIN_DF
+    os.makedirs(L(D_STATUS), exist_ok=True)
+    STATUS_FILE = L(D_STATUS, f"status_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{RUN_ID}.jsonl")
     setup_logging()
-    init_storage()
-    init_earth_engine()
-    targets = load_targets()
-    gids = targets["GID_3"].tolist()
-    log.info(f"Danh mục: {len(gids):,} xã thuộc {targets['GID_1'].nunique()} tỉnh | năm {YEAR} | "
-             f"lưu vào '{DRIVE_FOLDER_NAME}' | lượt {RUN_ID}")
+    log.info(f"VNGISDash {YEAR} | chế độ {MODE} | đích {REMOTE_BASE} | {N_WORKERS} luồng")
+    try:
+        init_storage()
+        ADMIN_DF = build_admin_table()
+        targets = load_targets(ADMIN_DF)
+        init_earth_engine()
+    except Exception as exc:
+        log.error(f"Khởi tạo thất bại: {type(exc).__name__}: {exc}")
+        log.error(PREFLIGHT_HINT)
+        return 1
+    rows = {r["GID_3"]: r for r in targets.to_dict("records")}
+    gids = list(rows)
+    log.info(f"Danh sách: {len(gids):,} xã, {targets['GID_1'].nunique()} tỉnh"
+             + (f" (thí điểm: {', '.join(gids)})" if MODE == "pilot" else ""))
 
-    if not _in_notebook():
-        install_signal_handlers()
+    statuses = load_all_status()
+    if PREFLIGHT:
+        pend = [g for g in gids if not core_finished(statuses.get(g))] or gids
+        for attempt in (1, 2, 3):
+            try:
+                preflight(rows[pend[0]])
+                break
+            except Exception as exc:
+                log.error(f"[preflight] THẤT BẠI (lần {attempt}/3): {type(exc).__name__}: {exc}")
+                if isinstance(exc, PreflightError) or _classify(str(exc)) == "permanent":
+                    log.error(PREFLIGHT_HINT)
+                    rclone_sync_once(final=True)
+                    return 1
+                if attempt == 3:
+                    log.error(PREFLIGHT_HINT)
+                    rclone_sync_once(final=True)
+                    return 1
+                time.sleep(20 * attempt)
+
+    install_signal_handlers()
     if MAX_RUNTIME_SEC > 0:
-        timer = threading.Timer(MAX_RUNTIME_SEC, request_stop, args=("deadline",))
-        timer.daemon = True
-        timer.start()
-        log.info(f"Ngân sách thời gian lượt này: {MAX_RUNTIME_SEC/3600:.2f} giờ")
+        t = threading.Timer(MAX_RUNTIME_SEC, request_stop, args=("deadline",))
+        t.daemon = True
+        t.start()
+        log.info(f"Thời gian tối đa của lượt: {MAX_RUNTIME_SEC/3600:.2f} giờ")
+    if drive_stop_exists():
+        log.warning("Có file _control/STOP trên Drive: không chạy.")
+        return 130
 
-    uploader = Uploader() if STORAGE_MODE == "rclone" else None
-    if uploader:
-        uploader.start()
+    uploader = Uploader()
+    uploader.start()
     outages, code = 0, 0
     try:
-        while True:
+        while not STOP_EVENT.is_set():
             statuses = load_all_status()
             write_progress(targets, statuses)
-            todo = [g for g in gids if not is_finished(statuses.get(g))]
-            if not todo or STOP_EVENT.is_set():
+            jobs = [(g, rows[g], "full") for g in gids if not core_finished(statuses.get(g))]
+            if not jobs:
                 break
-            log.info(f"Còn {len(todo):,} xã cần xử lý")
-            result = run_round(todo, statuses, len(gids))
+            log.info(f"Vòng mới: {len(jobs):,} xã cần xử lý")
+            result = run_round(jobs, statuses)
             if result == "stop":
                 break
             if result == "outage":
                 outages += 1
                 if outages >= MAX_OUTAGES:
-                    log.error("Sự cố kéo dài, thoát mã 2.")
                     code = 2
                     break
-                STOP_EVENT.wait(OUTAGE_SLEEP_SEC)    # nghỉ, nhưng vẫn nhận tín hiệu dừng
+                STOP_EVENT.wait(OUTAGE_SLEEP_SEC)
             else:
                 outages = 0
-    except KeyboardInterrupt:                        # notebook hoặc terminal không cài bộ bắt tín hiệu
-        log.warning("Đã dừng tay. Chạy lại để tiếp tục từ chỗ dừng.")
+    except KeyboardInterrupt:
         code = 130
     finally:
-        if uploader:
-            uploader.stop_event.set()
-            uploader.join(timeout=900)
+        uploader.stop_event.set()
+        uploader.join(timeout=60)
 
     statuses = load_all_status()
     progress = write_progress(targets, statuses)
-    unfinished = [g for g in gids if not is_finished(statuses.get(g))]
+    unfinished = [g for g in gids if not core_finished(statuses.get(g))]
+    rclone_sync_once(final=True)
 
-    if not unfinished:
-        if STORAGE_MODE == "rclone":
-            # Máy mới hoặc ổ đã dọn: kéo CSV của các xã từ Drive về trước khi gộp,
-            # tránh ghi file gộp rỗng đè lên bản đúng trên Drive.
-            missing = [st for st in statuses.values() if st.get("rel_dir")
-                       and not os.path.isdir(os.path.join(LOCAL_ROOT, st["rel_dir"], "CSV"))]
-            if missing:
-                log.info(f"Kéo CSV của {len(missing):,} xã từ Drive về để gộp...")
-                _rclone(["copy", f"{REMOTE_BASE}/{SUB_PROV}", WORK_PROV_ROOT,
-                         "--filter", "+ *.csv", "--filter", "- *", *RCLONE_COMMON])
-        build_combined({g: statuses[g] for g in gids if g in statuses})
-        if STORAGE_MODE == "rclone":
-            log.info("Đồng bộ lượt cuối lên Drive...")
-            rclone_sync_once(final=True)
-        log.info(f"HOÀN TẤT TOÀN BỘ: {progress['status'].value_counts().to_dict()}")
-        return 0
-
-    if STORAGE_MODE == "rclone":
-        log.info("Đồng bộ phần đã làm lên Drive trước khi thoát...")
+    if not unfinished and not STOP_EVENT.is_set():
+        build_merged(pull=True)
         rclone_sync_once(final=True)
+        failed = progress[progress["status"] != "done"]
+        log.info(f"HOÀN TẤT: {progress['status'].value_counts().to_dict()}")
+        if len(failed):
+            log.warning(f"{len(failed)} xã không đạt sau {MAX_ATTEMPTS} lần, xem _control/progress.csv")
+        return code or 0
+
     log.info(f"Chưa xong: còn {len(unfinished):,} xã | {progress['status'].value_counts().to_dict()}")
     if code:
         return code
-    return 3 if STOP_REASON[0] == "deadline" else 130
+    if STOP_REASON[0] == "fatal":
+        log.error(f"Dừng vì lỗi tải ảnh. Lỗi gần nhất: {_dl_stats['last_err']}")
+        log.error(PREFLIGHT_HINT)
+        return 1
+    if STOP_REASON[0] in ("signal", "drive_stop"):
+        return 130
+    return 3
+
 
 if __name__ == "__main__" and os.environ.get("VNGIS_SKIP_MAIN") != "1":
     if "--sync-only" in sys.argv:
-        # Dùng ở bước cuối của workflow: đẩy nốt những gì còn trên máy lên Drive.
         setup_logging()
-        if STORAGE_MODE == "rclone":
-            rclone_sync_once(final=True)
-            log.info("Đồng bộ nốt xong.")
+        rclone_sync_once(final=True)
+        log.info("Đồng bộ nốt xong.")
         sys.exit(0)
-    exit_code = main()
-    if not _in_notebook():
-        sys.exit(exit_code)
+    if "--merge-only" in sys.argv:
+        setup_logging()
+        build_merged(pull=True)
+        rclone_sync_once(final=True)
+        sys.exit(0)
+    sys.exit(main())
