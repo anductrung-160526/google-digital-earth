@@ -68,8 +68,9 @@ jobs:
       VNGIS_UPLOAD_EVERY_SEC: "60"
       VNGIS_MAX_RUNTIME_SEC: "18900"
       VNGIS_EE_HIGH_VOLUME: "false"
+      VNGIS_EE_CONCURRENCY: "8"       # số lệnh gọi Earth Engine cùng lúc tối đa; code tự hạ thêm khi bị 429
       # Dung lượng ảnh ngày (xem HUONG_DAN.md mục "Dung lượng ảnh ngày")
-      VNGIS_DAY_FORMAT: "float"       # int16 = nhỏ hơn ~3-4 lần, sai số 0,00005 | float = như bản 4
+      VNGIS_DAY_FORMAT: "float"       # float = như bản 4, không mất dữ liệu | int16 = nhỏ hơn ~3-4 lần
       VNGIS_DAY_BANDS: "10"           # 10 = đủ như notebook | 6 = chỉ BLUE..SWIR2, nhỏ hơn ~40%
       VNGIS_DAY_SCALE: "10000"        # chỉ dùng khi int16: 10000 (sai số 0,00005) | 1000 (nhỏ thêm ~40%)
     steps:
