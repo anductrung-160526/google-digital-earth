@@ -4,8 +4,8 @@ name: VNGISDash 2024 (chạy nối lượt)
 # Trạng thái nằm trên Google Drive nên lượt sau tiếp tục đúng chỗ dừng.
 #
 # Không cần chọn tỉnh, xã.
-# mode = pilot: tự lấy pilot_n xã (xen kẽ phường, xã; mặc định 2), ghi vào VNGISDash_PILOT_2024 và tự kiểm tra bằng verify_pilot.py.
-# mode = full : chạy toàn bộ xã, ghi vào VNGISDash_Communes_2024.
+# mode = pilot: tự lấy pilot_n xã (xen kẽ phường, xã; mặc định 2), ghi vào VNGISDash_2024_PILOT và tự kiểm tra bằng verify_pilot.py.
+# mode = full : chạy toàn bộ xã, ghi vào VNGISDash_2024.
 # Dừng: tạo file STOP ở thư mục gốc repo, hoặc file _control/STOP trong thư mục trên Drive.
 # Luôn bấm "Run workflow". Không dùng "Re-run all jobs" (nút đó chạy lại với input cũ).
 
@@ -38,7 +38,7 @@ env:
   VNGIS_MODE: ${{ inputs.mode }}
   VNGIS_PILOT_N: ${{ inputs.pilot_n }}
   # Thí điểm ghi vào thư mục riêng, không lẫn dữ liệu thật
-  VNGIS_DRIVE_FOLDER: ${{ inputs.mode == 'full' && 'VNGISDash_Communes_2024' || 'VNGISDash_PILOT_2024' }}
+  VNGIS_DRIVE_FOLDER: ${{ inputs.mode == 'full' && 'VNGISDash_2024' || 'VNGISDash_2024_PILOT' }}
   VNGIS_RCLONE_REMOTE: gdrive
 
 jobs:
@@ -68,19 +68,39 @@ jobs:
       VNGIS_UPLOAD_EVERY_SEC: "300"
       VNGIS_MAX_RUNTIME_SEC: "18900"
       VNGIS_EE_HIGH_VOLUME: "false"
+      VNGIS_DAY_BANDS: "6"            # 6 = BLUE..SWIR2 | 10 = thêm NDVI, NDBI, MNDWI, BSI (file lớn gần gấp đôi)
+      VNGIS_DAY_SCALE: "10000"        # 10000: sai số 0,00005 | 1000: file nhỏ thêm ~40%, sai số 0,0005
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: "3.11"
-          cache: pip
 
-      - name: Cài thư viện
-        run: pip install -r requirements.txt
+      # Giữ nguyên thư viện đã cài giữa các lượt: lượt sau bỏ qua bước cài (tiết kiệm ~30-60 giây)
+      - name: Cache thư viện Python và rclone
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/venv
+            ~/bin/rclone
+          key: deps-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-rclone1
 
-      - name: Cài rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+      - name: Cài thư viện và rclone (chỉ khi chưa có cache)
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: |
+          python -m venv ~/venv
+          ~/venv/bin/pip install -q -r requirements.txt
+          mkdir -p ~/bin && cd /tmp
+          curl -fsSL -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
+          unzip -q rclone.zip && cp rclone-*-linux-amd64/rclone ~/bin/ && chmod +x ~/bin/rclone
+
+      - name: Đưa venv và rclone vào PATH
+        run: |
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Cache ranh giới GADM
         uses: actions/cache@v4
