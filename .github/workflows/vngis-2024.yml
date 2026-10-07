@@ -1,23 +1,31 @@
 name: VNGISDash 2024 (chạy nối lượt)
 
-# Chạy pipeline theo từng lượt khoảng 5 giờ 15 phút. Hết lượt, workflow tự gọi lại chính nó
-# cho đến khi mọi xã xong. Trạng thái nằm trên Google Drive nên lượt sau tiếp tục đúng chỗ dừng.
+# Mỗi lượt chạy tối đa ~5 giờ 15 phút rồi tự gọi lượt kế tiếp cho đến khi mọi xã xong.
+# Trạng thái nằm trên Google Drive nên lượt sau tiếp tục đúng chỗ dừng.
 #
-# Dừng: tạo file tên STOP ở nhánh mặc định của repo (xem HUONG_DAN_GITHUB_ACTIONS.md).
+# Không cần chọn tỉnh, xã.
+# mode = pilot: tự lấy pilot_n xã (xen kẽ phường, xã; mặc định 2), ghi vào VNGISDash_PILOT_2024 và tự kiểm tra bằng verify_pilot.py.
+# mode = full : chạy toàn bộ xã, ghi vào VNGISDash_Communes_2024.
+# Dừng: tạo file STOP ở thư mục gốc repo, hoặc file _control/STOP trong thư mục trên Drive.
+# Luôn bấm "Run workflow". Không dùng "Re-run all jobs" (nút đó chạy lại với input cũ).
 
 on:
   workflow_dispatch:
     inputs:
-      test_limit:
-        description: "Chạy thử N xã đầu tiên (để trống = chạy tất cả)"
+      mode:
+        description: "pilot = thí điểm 2 xã | full = toàn bộ xã"
+        type: choice
+        options: [pilot, full]
+        default: pilot
+      pilot_n:
+        description: "Số xã thí điểm (chỉ dùng khi mode = pilot)"
         required: false
-        default: ""
+        default: "2"
       workers:
         description: "Số xã xử lý song song"
         required: false
         default: "8"
 
-# Không bao giờ có hai lượt chạy cùng lúc.
 concurrency:
   group: vngis-2024
   cancel-in-progress: false
@@ -25,6 +33,13 @@ concurrency:
 permissions:
   actions: write     # để lượt này gọi lượt kế tiếp
   contents: read     # để kiểm tra file STOP
+
+env:
+  VNGIS_MODE: ${{ inputs.mode }}
+  VNGIS_PILOT_N: ${{ inputs.pilot_n }}
+  # Thí điểm ghi vào thư mục riêng, không lẫn dữ liệu thật
+  VNGIS_DRIVE_FOLDER: ${{ inputs.mode == 'full' && 'VNGISDash_Communes_2024' || 'VNGISDash_PILOT_2024' }}
+  VNGIS_RCLONE_REMOTE: gdrive
 
 jobs:
   gate:
@@ -48,14 +63,11 @@ jobs:
     needs: gate
     if: needs.gate.outputs.stop != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 350              # GitHub hủy job ở 360 phút; chừa 10 phút
+    timeout-minutes: 350
     env:
-      VNGIS_STORAGE_MODE: rclone
-      VNGIS_RCLONE_REMOTE: gdrive
-      VNGIS_DRIVE_FOLDER: VNGISDash_Communes_2024
-      VNGIS_UPLOAD_EVERY_SEC: "300"   # đẩy ảnh lên Drive mỗi 5 phút, giữ ổ runner nhẹ
-      VNGIS_MAX_RUNTIME_SEC: "18900"  # 5 giờ 15 phút; sau đó dừng trật tự và đồng bộ
-      VNGIS_FETCH_OSM: "true"         # đổi thành "false" nếu Overpass chặn IP của GitHub
+      VNGIS_UPLOAD_EVERY_SEC: "300"
+      VNGIS_MAX_RUNTIME_SEC: "18900"
+      VNGIS_EE_HIGH_VOLUME: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +82,12 @@ jobs:
       - name: Cài rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
+      - name: Cache ranh giới GADM
+        uses: actions/cache@v4
+        with:
+          path: ~/vngis_2024/_cache
+          key: gadm41-vnm-v1
+
       - name: Ghi khóa truy cập từ Secrets
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
@@ -81,6 +99,7 @@ jobs:
           printf '%s' "$RCLONE_CONF_DATA" > "$HOME/.config/rclone/rclone.conf"
           printf '%s' "$EE_KEY_DATA" > "$RUNNER_TEMP/ee-key.json"
           chmod 600 "$HOME/.config/rclone/rclone.conf" "$RUNNER_TEMP/ee-key.json"
+          echo "Thư mục đích trên Drive: $VNGIS_DRIVE_FOLDER"
 
       - name: Chạy pipeline
         id: pipeline
@@ -88,14 +107,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VNGIS_EE_KEY_FILE: ${{ runner.temp }}/ee-key.json
           VNGIS_RUN_ID: ${{ github.run_id }}
-          VNGIS_TEST_LIMIT: ${{ inputs.test_limit }}
           VNGIS_WORKERS: ${{ inputs.workers }}
           STOP_POLL_SEC: "300"
         run: |
           set +e
-          python vngis_2024.py &
+          python -u vngis_2024.py &
           PID=$!
-          # Cứ 5 phút xem repo có file STOP không; có thì dừng trật tự (đồng bộ rồi thoát).
           (
             while kill -0 "$PID" 2>/dev/null; do
               for _ in $(seq 1 "$STOP_POLL_SEC"); do
@@ -118,10 +135,18 @@ jobs:
           echo "Script thoát với mã $code"
           exit 0
 
-      - name: Đồng bộ nốt lên Drive (luôn chạy, kể cả khi bị hủy)
+      - name: Đồng bộ nốt lên Drive (luôn chạy)
         if: always()
         continue-on-error: true
         run: python vngis_2024.py --sync-only
+
+      - name: Kiểm tra kết quả thí điểm
+        if: always() && inputs.mode == 'pilot' && steps.pipeline.outputs.code == '0'
+        continue-on-error: true
+        run: |
+          python verify_pilot.py --remote "${VNGIS_RCLONE_REMOTE}:${VNGIS_DRIVE_FOLDER}" \
+            --report "$RUNNER_TEMP/verify_report.md"
+          cat "$RUNNER_TEMP/verify_report.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tóm tắt tiến độ
         if: always()
@@ -129,25 +154,28 @@ jobs:
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import os, pandas as pd
-          p = os.path.expanduser("~/vngis_2024/04_Status/progress.csv")
+          p = os.path.expanduser(f"~/vngis_2024/{os.environ['VNGIS_DRIVE_FOLDER']}/_control/progress.csv")
           if os.path.isfile(p):
               d = pd.read_csv(p)
-              print("### Tiến độ VNGISDash 2024\n")
-              print(f"Tổng {len(d):,} xã: {d['status'].value_counts().to_dict()}")
+              print(f"### Tiến độ ({os.environ['VNGIS_DRIVE_FOLDER']})\n")
+              print(f"Tổng {len(d):,} xã: {d['status'].value_counts().to_dict()}\n")
+              bad = d[d['status'] != 'done'].head(15)
+              if len(bad):
+                  print("| GID_3 | trạng thái | lỗi |\n|---|---|---|")
+                  for r in bad.itertuples():
+                      print(f"| {r.GID_3} | {r.status} | {str(r.errors)[:150]} |")
           PY
 
       - name: Nối lượt kế tiếp
         if: steps.pipeline.outputs.code == '3' || steps.pipeline.outputs.code == '2'
         env:
           GH_TOKEN: ${{ github.token }}
-          TEST_LIMIT: ${{ inputs.test_limit }}
-          WORKERS: ${{ inputs.workers }}
         run: |
           if gh api "repos/${GITHUB_REPOSITORY}/contents/STOP" > /dev/null 2>&1; then
             echo "::notice::Có file STOP: dừng chuỗi, không nối lượt."
           else
             gh workflow run vngis-2024.yml --ref "$GITHUB_REF_NAME" \
-              -f test_limit="$TEST_LIMIT" -f workers="$WORKERS"
+              -f mode="${{ inputs.mode }}" -f pilot_n="${{ inputs.pilot_n }}" -f workers="${{ inputs.workers }}"
             echo "Đã gọi lượt kế tiếp."
           fi
 
@@ -157,5 +185,5 @@ jobs:
           steps.pipeline.outputs.code != '0' && steps.pipeline.outputs.code != '2' &&
           steps.pipeline.outputs.code != '3' && steps.pipeline.outputs.code != '130'
         run: |
-          echo "::error::Script thoát với mã ${{ steps.pipeline.outputs.code }}. Xem log bước 'Chạy pipeline'."
+          echo "::error::Script thoát với mã ${{ steps.pipeline.outputs.code }}. Mở bước 'Chạy pipeline', tìm các dòng [preflight] hoặc ERROR."
           exit 1
