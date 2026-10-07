@@ -58,7 +58,7 @@ MODE = _env("VNGIS_MODE", "pilot").lower()                        # pilot | full
 if MODE not in ("pilot", "full"):
     raise SystemExit(f"VNGIS_MODE phải là 'pilot' hoặc 'full', đang là '{MODE}'")
 PILOT_N = _env("VNGIS_PILOT_N", 2, int)
-if PILOT_N < 1:
+if MODE == "pilot" and PILOT_N < 1:                   # chế độ full không dùng số này
     raise SystemExit("VNGIS_PILOT_N phải >= 1")
 
 # Ảnh ngày: số kênh lưu vào tif. 6 = BLUE..SWIR2 (NDVI, NDBI, MNDWI, BSI tính lại được từ 6 kênh này);
@@ -94,8 +94,67 @@ DOWNLOAD_FAIL_LIMIT = 24
 MAX_TILE_SPLIT = 8
 TILING_OK = [True]
 
-EE_SEM = threading.BoundedSemaphore(EE_CONCURRENCY)
-DL_SEM = threading.BoundedSemaphore(EE_CONCURRENCY)
+class AdaptiveLimiter:
+    """Giới hạn số lệnh gọi Earth Engine cùng lúc, tự hạ khi bị 429 (vượt hạn mức) và tăng dần lại khi ổn."""
+
+    def __init__(self, maximum):
+        self.max = max(1, maximum)
+        self.limit = self.max
+        self.active = 0
+        self.ok_streak = 0
+        self.cv = threading.Condition()
+
+    def __enter__(self):
+        with self.cv:
+            while self.active >= self.limit:
+                self.cv.wait(1)
+            self.active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self.cv:
+            self.active -= 1
+            self.cv.notify_all()
+        return False
+
+    def on_rate_limited(self):
+        with self.cv:
+            new = max(1, int(self.limit * 0.7))
+            if new < self.limit:
+                log.warning(f"Earth Engine báo vượt hạn mức (429): hạ số lệnh gọi cùng lúc {self.limit} -> {new}")
+            self.limit, self.ok_streak = new, 0
+
+    def on_success(self):
+        with self.cv:
+            self.ok_streak += 1
+            if self.ok_streak >= 50 and self.limit < self.max:
+                self.limit += 1
+                self.ok_streak = 0
+                self.cv.notify_all()
+
+
+EE_SEM = AdaptiveLimiter(EE_CONCURRENCY)
+DL_SEM = EE_SEM
+RATE_LIMIT_MAX_WAIT_SEC = _env("VNGIS_RATE_LIMIT_MAX_WAIT_SEC", 900, int)   # chờ tối đa 15 phút cho mỗi lệnh bị 429
+_RATE_ERR = ("429", "too many requests", "concurrency limit", "rate limit", "quota exceeded",
+             "resource_exhausted", "resource exhausted")
+
+
+def is_rate_limited(msg):
+    low = str(msg).lower()
+    return any(k in low for k in _RATE_ERR)
+
+
+def rate_limit_sleep(waited, attempt):
+    """Chờ tăng dần (5s, 10s, 20s ... tối đa 120s, có ngẫu nhiên). Trả tổng thời gian đã chờ."""
+    import random
+    EE_SEM.on_rate_limited()
+    d = min(120, 5 * (2 ** min(attempt, 5))) * random.uniform(0.7, 1.3)
+    deadline = time.time() + d
+    while time.time() < deadline:
+        check_stop()
+        time.sleep(1)
+    return waited + d
 
 DRIVE_FOLDER = _env("VNGIS_DRIVE_FOLDER", "VNGISDash_2024_PILOT" if MODE == "pilot" else "VNGISDash_2024")
 RCLONE_REMOTE = _env("VNGIS_RCLONE_REMOTE", "gdrive")
@@ -343,8 +402,20 @@ VIIRS_B = "NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG"
 
 
 def ee_getinfo(obj):
-  with EE_SEM:
-    return obj.getInfo()
+  """getInfo có xử lý 429: chờ rồi thử lại, không tính là lỗi của xã."""
+  waited, attempt = 0.0, 0
+  while True:
+    check_stop()
+    try:
+      with EE_SEM:
+        out = obj.getInfo()
+      EE_SEM.on_success()
+      return out
+    except ee.EEException as exc:
+      if not is_rate_limited(exc) or waited > RATE_LIMIT_MAX_WAIT_SEC:
+        raise
+      waited = rate_limit_sleep(waited, attempt)
+      attempt += 1
 
 
 # ---------- Kế hoạch tải: 1 lần gọi cho cả 12 tháng ----------
@@ -560,13 +631,19 @@ def _classify(msg):
 def fetch_geotiff_bytes(img, region, scale, max_retry=4):
     """Đúng tham số notebook cell 21. Trả bytes GeoTIFF; lỗi nào cũng kèm mã HTTP và nội dung."""
     last = None
-    for attempt in range(max_retry):
+    attempt, waited, rl = 0, 0.0, 0
+    while attempt < max_retry:
         check_stop()
         try:
             with EE_SEM:
                 url = img.getDownloadURL({"region": region, "scale": scale, "crs": "EPSG:4326",
                                           "format": "GEO_TIFF", "filePerBand": False})
         except ee.EEException as exc:
+            if is_rate_limited(exc) and waited <= RATE_LIMIT_MAX_WAIT_SEC:
+                waited = rate_limit_sleep(waited, rl)
+                rl += 1
+                last = f"429: {exc}"
+                continue
             kind = _classify(str(exc))
             if kind == "too_large":
                 raise TooLargeError(str(exc))
@@ -574,6 +651,7 @@ def fetch_geotiff_bytes(img, region, scale, max_retry=4):
                 raise PermanentError(f"getDownloadURL bị từ chối: {exc}")
             last = f"getDownloadURL: {exc}"
             time.sleep(5 * (attempt + 1))
+            attempt += 1
             continue
         try:
             with DL_SEM:
@@ -581,10 +659,16 @@ def fetch_geotiff_bytes(img, region, scale, max_retry=4):
         except requests.RequestException as exc:
             last = f"mạng: {exc}"
             time.sleep(5 * (attempt + 1))
+            attempt += 1
             continue
         if r.status_code >= 400:
             body = (r.text or "")[:400].replace("\n", " ")
             msg = f"HTTP {r.status_code}: {body}"
+            if (r.status_code == 429 or is_rate_limited(body)) and waited <= RATE_LIMIT_MAX_WAIT_SEC:
+                waited = rate_limit_sleep(waited, rl)
+                rl += 1
+                last = msg
+                continue
             kind = _classify(msg) if r.status_code not in (401, 403) else "permanent"
             if kind == "too_large":
                 raise TooLargeError(msg)
@@ -592,6 +676,7 @@ def fetch_geotiff_bytes(img, region, scale, max_retry=4):
                 raise PermanentError(msg)
             last = msg
             time.sleep(5 * (attempt + 1))
+            attempt += 1
             continue
         data = r.content
         if data[:2] == b"PK":                       # đôi khi EE trả về file zip (notebook cell 21)
@@ -600,7 +685,9 @@ def fetch_geotiff_bytes(img, region, scale, max_retry=4):
         if len(data) < 200:
             last = f"file tải về chỉ {len(data)} byte"
             time.sleep(5 * (attempt + 1))
+            attempt += 1
             continue
+        EE_SEM.on_success()
         return data
     raise RuntimeError(f"Tải thất bại sau {max_retry} lần: {last}")
 
@@ -1115,8 +1202,14 @@ def reconcile_with_drive(statuses, rows):
 
 
 def core_finished(st):
-    return bool(st) and (st.get("status") == "done" or st.get("status") == "not_in_asset"
-                         or int(st.get("attempts", 0)) >= MAX_ATTEMPTS)
+    if not st:
+        return False
+    if st.get("status") in ("done", "not_in_asset"):
+        return True
+    # Lỗi do vượt hạn mức Earth Engine (429) là lỗi tạm thời: không tính vào số lần thử, luôn làm lại
+    if is_rate_limited(" ".join(st.get("errors") or [])):
+        return False
+    return int(st.get("attempts", 0)) >= MAX_ATTEMPTS
 
 
 
