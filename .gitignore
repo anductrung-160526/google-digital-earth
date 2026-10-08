@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.json
+!requirements.txt
+.ipynb_checkpoints/
+vngis_2024_local/
+*.tif

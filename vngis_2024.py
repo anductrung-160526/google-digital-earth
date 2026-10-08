@@ -13,23 +13,21 @@ Cấu trúc đầu ra (cấp 1 = thư mục trên Drive):
   CSV/day_indices.csv, CSV/night_indices.csv         (gộp toàn quốc)
   _control/                                         (trạng thái, log, báo cáo)
 
-Tăng tốc so với notebook (không đổi công thức, tham số): Task 1 và Task 3.2 gom 12 tháng thành 1 lần gọi
-Earth Engine; việc kiểm tra "tháng có ảnh không" của Task 2/3.1 gom thành 1 lần gọi; 24 ảnh của một xã
-tải song song.
+Nền khoa học v6 được giữ nguyên. Điều phối trong v6_runtime.py kiểm kê dữ liệu thật,
+hoàn tất toàn bộ ngày rồi mới xử lý đêm. Chỉ tải ảnh thiếu/lỗi; chỉ số cũ hợp lệ được giữ.
 
 Chạy:
-    python vngis_2024.py inventory     kiểm kê dữ liệu đã có
-    python vngis_2024.py day           chạy batch phần ngày
-    python vngis_2024.py night         chạy batch phần đêm sau khi ngày đạt
+    python vngis_2024.py               chạy pipeline
+    python vngis_2024.py --sync-only   đẩy nốt dữ liệu trên máy lên Drive
 
-CLI hiện dùng process_exports.py và data_contract.py; các hàm khoa học dưới đây
-giữ nguyên để luồng batch dùng lại. Xem HUONG_DAN_BATCH.md.
-
-Mã thoát: 0 xong toàn bộ | 1 lỗi cấu hình hoặc preflight | 2 sự cố EE kéo dài | 3 hết giờ (nối lượt) | 130 dừng tay
+Mã thoát: 0 bước yêu cầu hoàn tất | 1 lỗi/hết giới hạn thử | 3 hết giờ (nối lượt) | 130 dừng tay
 """
 
 import os, io, re, sys, json, time, glob, math, shutil, zipfile, signal, logging, calendar, struct
 import threading, subprocess, unicodedata, warnings
+sys.modules.setdefault("vngis_2024", sys.modules[__name__])
+import data_contract as D
+from request_control import RequestGate, retry_delay, status_code
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -55,37 +53,35 @@ def _env(name, default, cast=str):
 YEAR = 2024
 MONTHS = list(range(1, 13))
 
-PROJECT_ID = "vngis-ee-2"                               # notebook cell 11
-ASSET_ID = f"projects/{PROJECT_ID}/assets/communes_l3"             # notebook cell 11
+PROJECT_ID = _env("VNGIS_EE_PROJECT", "vngis-ee-2")                               # notebook cell 11
+ASSET_ID = _env("VNGIS_EE_ASSET", f"projects/{PROJECT_ID}/assets/communes_l3")             # notebook cell 11
 
 MODE = _env("VNGIS_MODE", "pilot").lower()                        # pilot | full
 if MODE not in ("pilot", "full"):
     raise SystemExit(f"VNGIS_MODE phải là 'pilot' hoặc 'full', đang là '{MODE}'")
 PILOT_N = _env("VNGIS_PILOT_N", 2, int)
-if MODE == "pilot" and PILOT_N < 1:                   # chế độ full không dùng số này
+if PILOT_N < 1:
     raise SystemExit("VNGIS_PILOT_N phải >= 1")
 
 # Ảnh ngày: số kênh lưu vào tif. 6 = BLUE..SWIR2 (NDVI, NDBI, MNDWI, BSI tính lại được từ 6 kênh này);
 # 10 = đủ 10 kênh như notebook (file lớn gần gấp đôi).
 DAY_BANDS_ALL = ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2", "NDVI", "NDBI", "MNDWI", "BSI"]
 DAY_BANDS = _env("VNGIS_DAY_BANDS", 10, int)
-if DAY_BANDS not in (6, 10):
-    raise SystemExit("VNGIS_DAY_BANDS phải là 6 hoặc 10")
+if DAY_BANDS != 10:
+    raise SystemExit("Luồng v6 này yêu cầu đủ 10 kênh ảnh ngày")
 # Kiểu lưu ảnh ngày: float = giữ nguyên giá trị Earth Engine trả về, nén DEFLATE không mất dữ liệu (như bản 4);
 # int16 = số nguyên round(giá trị × VNGIS_DAY_SCALE), file nhỏ hơn ~3-4 lần nhưng nhiều trình xem không mở được.
 DAY_FORMAT = _env("VNGIS_DAY_FORMAT", "float").lower()
-if DAY_FORMAT not in ("float", "int16"):
-    raise SystemExit("VNGIS_DAY_FORMAT phải là float hoặc int16")
+if DAY_FORMAT != "float":
+    raise SystemExit("Luồng v6 này yêu cầu ảnh ngày float, không lượng tử hóa")
 DAY_SCALE_INV = _env("VNGIS_DAY_SCALE", 10000, int)  # int16 = round(giá trị × 10000); 1000 cho file nhỏ hơn ~40%
 if DAY_SCALE_INV not in (1000, 10000):
     raise SystemExit("VNGIS_DAY_SCALE phải là 10000 hoặc 1000")
 DAY_NODATA = -32768
 
-N_WORKERS = _env("VNGIS_WORKERS", 8, int)                         # số xã chạy song song
-if MODE == "pilot":
-    N_WORKERS = max(N_WORKERS, min(PILOT_N, 16))                  # thí điểm: mọi xã chạy cùng lúc
-MONTH_THREADS = _env("VNGIS_MONTH_THREADS", 12, int)              # số ảnh tải song song trong 1 xã
-EE_CONCURRENCY = _env("VNGIS_EE_CONCURRENCY", 24, int)            # tổng số lệnh gọi EE cùng lúc
+N_WORKERS = _env("VNGIS_WORKERS", 2, int)                         # số xã chạy song song
+MONTH_THREADS = _env("VNGIS_MONTH_THREADS", 2, int)              # số ảnh tải song song trong 1 xã
+EE_CONCURRENCY = _env("VNGIS_EE_CONCURRENCY", 4, int)            # tổng số lệnh gọi EE cùng lúc
 RUN_ID = _env("VNGIS_RUN_ID", "local")
 MAX_RUNTIME_SEC = _env("VNGIS_MAX_RUNTIME_SEC", 0, int)
 EE_KEY_FILE = _env("VNGIS_EE_KEY_FILE", "")
@@ -98,77 +94,17 @@ DOWNLOAD_FAIL_LIMIT = 24
 MAX_TILE_SPLIT = 8
 TILING_OK = [True]
 
-class AdaptiveLimiter:
-    """Giới hạn số lệnh gọi Earth Engine cùng lúc, tự hạ khi bị 429 (vượt hạn mức) và tăng dần lại khi ổn."""
-
-    def __init__(self, maximum):
-        self.max = max(1, maximum)
-        self.limit = self.max
-        self.active = 0
-        self.ok_streak = 0
-        self.cv = threading.Condition()
-
-    def __enter__(self):
-        with self.cv:
-            while self.active >= self.limit:
-                self.cv.wait(1)
-            self.active += 1
-        return self
-
-    def __exit__(self, *exc):
-        with self.cv:
-            self.active -= 1
-            self.cv.notify_all()
-        return False
-
-    def on_rate_limited(self):
-        with self.cv:
-            new = max(1, int(self.limit * 0.7))
-            if new < self.limit:
-                log.warning(f"Earth Engine báo vượt hạn mức (429): hạ số lệnh gọi cùng lúc {self.limit} -> {new}")
-            self.limit, self.ok_streak = new, 0
-
-    def on_success(self):
-        with self.cv:
-            self.ok_streak += 1
-            if self.ok_streak >= 50 and self.limit < self.max:
-                self.limit += 1
-                self.ok_streak = 0
-                self.cv.notify_all()
-
-
-EE_SEM = AdaptiveLimiter(EE_CONCURRENCY)
-DL_SEM = EE_SEM
-RATE_LIMIT_MAX_WAIT_SEC = _env("VNGIS_RATE_LIMIT_MAX_WAIT_SEC", 900, int)   # chờ tối đa 15 phút cho mỗi lệnh bị 429
-_RATE_ERR = ("429", "too many requests", "concurrency limit", "rate limit", "quota exceeded",
-             "resource_exhausted", "resource exhausted")
-
-
-def is_rate_limited(msg):
-    low = str(msg).lower()
-    return any(k in low for k in _RATE_ERR)
-
-
-def rate_limit_sleep(waited, attempt):
-    """Chờ tăng dần (5s, 10s, 20s ... tối đa 120s, có ngẫu nhiên). Trả tổng thời gian đã chờ."""
-    import random
-    EE_SEM.on_rate_limited()
-    d = min(120, 5 * (2 ** min(attempt, 5))) * random.uniform(0.7, 1.3)
-    deadline = time.time() + d
-    while time.time() < deadline:
-        check_stop()
-        time.sleep(1)
-    return waited + d
+EE_QPS = _env("VNGIS_EE_QPS", 2.0, float)
+REQUEST_ATTEMPTS = _env("VNGIS_REQUEST_ATTEMPTS", 6, int)
+if min(N_WORKERS, MONTH_THREADS, EE_CONCURRENCY, MAX_ATTEMPTS, REQUEST_ATTEMPTS) < 1 or EE_QPS <= 0:
+    raise SystemExit("Workers, concurrency, QPS và attempts phải > 0")
 
 DRIVE_FOLDER = _env("VNGIS_DRIVE_FOLDER", "VNGISDash_2024_PILOT" if MODE == "pilot" else "VNGISDash_2024")
 RCLONE_REMOTE = _env("VNGIS_RCLONE_REMOTE", "gdrive")
 REMOTE_BASE = f"{RCLONE_REMOTE}:{DRIVE_FOLDER}"
 LOCAL_ROOT = _env("VNGIS_LOCAL_ROOT", os.path.expanduser(f"~/vngis_2024/{DRIVE_FOLDER}"))
 CACHE_DIR = _env("VNGIS_CACHE_DIR", os.path.expanduser("~/vngis_2024/_cache"))
-UPLOAD_EVERY_SEC = _env("VNGIS_UPLOAD_EVERY_SEC", 60, int)
-MIN_FREE_GB = _env("VNGIS_MIN_FREE_GB", 4.0, float)          # ổ máy chạy còn ít hơn mức này: tạm dừng tải, đẩy lên Drive trước
-RCLONE_TRANSFERS = _env("VNGIS_RCLONE_TRANSFERS", 16, int)
-UPLOAD_NOW = threading.Event()                                # yêu cầu uploader đồng bộ ngay
+UPLOAD_EVERY_SEC = _env("VNGIS_UPLOAD_EVERY_SEC", 300, int)
 DRIVE_STOP_POLL_SEC = 300
 
 D_DAY, D_NIGHT, D_CSV, D_CONTROL = "Day", "Night", "CSV", "_control"
@@ -182,11 +118,8 @@ GADM_VNM_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_VNM_shp.zip"
 ADM_COLS = ["GID_1", "NAME_1", "GID_2", "NAME_2", "GID_3", "NAME_3", "TYPE_3"]     # notebook cell 3
 
 T1_FEATURES = [f"{b}_{s}" for b in DAY_BANDS_ALL for s in ("mean", "stdDev")]    # notebook cell 15
-DAY_COLUMNS = ADM_COLS + T1_FEATURES + ["YEAR", "MONTH"]
-NIGHT_COLUMNS = ["GID_1", "NAME_1", "GID_3", "NAME_3", "YEAR", "MONTH", "TIME", "COMMUNE_AREA_HA", "TNL",
-                 "MEAN_RAD", "STD_RAD", "MIN_RAD", "MAX_RAD", "SPATIAL_CV", "LIT_PIXELS", "LIT_AREA_HA",
-                 "ELECTRIFICATION_RATIO_PCT", "LIT_POP_PROXY", "CLOUD_FREE_OBS", "TNL_MA3",
-                 "TNL_MOM_GROWTH_PCT"]                                               # notebook cell 38
+DAY_COLUMNS = D.COLUMNS["day"]
+NIGHT_COLUMNS = D.COLUMNS["night"]
 
 log = logging.getLogger("vngis")
 
@@ -217,6 +150,9 @@ def request_stop(reason):
 def check_stop():
     if STOP_EVENT.is_set():
         raise StopRequested()
+
+
+REQUEST_GATE = RequestGate(EE_CONCURRENCY, EE_QPS, check_stop, STOP_EVENT)
 
 
 def install_signal_handlers():
@@ -315,6 +251,7 @@ EE_CREDENTIALS = None
 
 def init_earth_engine():
     global communes_fc, EE_CREDENTIALS
+    ee.data.setMaxRetries(0)  # application retries own the bounded backoff
     kwargs = {"project": PROJECT_ID}
     if EE_HIGH_VOLUME:
         kwargs["opt_url"] = "https://earthengine-highvolume.googleapis.com"
@@ -322,11 +259,11 @@ def init_earth_engine():
         with open(EE_KEY_FILE, encoding="utf-8") as f:
             email = json.load(f)["client_email"]
         EE_CREDENTIALS = ee.ServiceAccountCredentials(email, EE_KEY_FILE)
-        ee.Initialize(credentials=EE_CREDENTIALS, **kwargs)
+        REQUEST_GATE.call("Earth Engine", lambda: ee.Initialize(credentials=EE_CREDENTIALS, **kwargs), REQUEST_ATTEMPTS)
         log.info(f"Earth Engine sẵn sàng: service account {email}, endpoint "
                  f"{'high-volume' if EE_HIGH_VOLUME else 'standard'}.")
     else:
-        ee.Initialize(**kwargs)
+        REQUEST_GATE.call("Earth Engine", lambda: ee.Initialize(**kwargs), REQUEST_ATTEMPTS)
         try:
             EE_CREDENTIALS = ee.data.get_persistent_credentials()
         except Exception:
@@ -406,41 +343,42 @@ VIIRS_B = "NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG"
 
 
 def ee_getinfo(obj):
-  """getInfo có xử lý 429: chờ rồi thử lại, không tính là lỗi của xã."""
-  waited, attempt = 0.0, 0
-  while True:
-    check_stop()
-    try:
-      with EE_SEM:
-        out = obj.getInfo()
-      EE_SEM.on_success()
-      return out
-    except ee.EEException as exc:
-      if not is_rate_limited(exc) or waited > RATE_LIMIT_MAX_WAIT_SEC:
-        raise
-      waited = rate_limit_sleep(waited, attempt)
-      attempt += 1
+  return REQUEST_GATE.call("Earth Engine", obj.getInfo, REQUEST_ATTEMPTS)
 
 
 # ---------- Kế hoạch tải: 1 lần gọi cho cả 12 tháng ----------
-def fetch_plan(commune_fc, commune_geom):
-  """Số cảnh ảnh của từng cửa sổ (Task 2) và từng bộ VIIRS (Task 3.1) cho 12 tháng, cùng số xã khớp trong asset.
-  Python dùng các con số này để chọn nhánh y hệt các câu lệnh if trong notebook cell 18 và 34."""
+def fetch_plan(commune_fc, commune_geom, phase="day"):
+  """Same v6 windows/VIIRS precedence; query only the active phase, recording source counts."""
   months = []
   for m in MONTHS:
-    s2 = [ee.ImageCollection(S2_COLLECTION).filterBounds(commune_geom).filterDate(s, e).size()
-          for s, e in _s2_windows(YEAR, m)]
     s_date, e_date = _month_dates(YEAR, m)
-    va = ee.ImageCollection(VIIRS_A).filterBounds(commune_geom).filterDate(s_date, e_date).size()
-    vb = ee.ImageCollection(VIIRS_B).filterBounds(commune_geom).filterDate(s_date, e_date).size()
-    months.append(ee.List(s2 + [va, vb]))
+    if phase == "day":
+      s2 = [ee.ImageCollection(S2_COLLECTION).filterBounds(commune_geom).filterDate(s, e).size()
+            for s, e in _s2_windows(YEAR, m)]
+      raw = ee.ImageCollection(S2_COLLECTION).filterBounds(commune_fc).filterDate(s_date, e_date).size()
+      months.append(ee.List(s2 + [raw]))
+    elif phase == "night":
+      va = ee.ImageCollection(VIIRS_A).filterBounds(commune_geom).filterDate(s_date, e_date).size()
+      vb = ee.ImageCollection(VIIRS_B).filterBounds(commune_geom).filterDate(s_date, e_date).size()
+      months.append(ee.List([va, vb]))
+    else:
+      raise ValueError("phase phải là day hoặc night")
   out = ee_getinfo(ee.Dictionary({"n_fc": commune_fc.size(), "months": ee.List(months)}))
+  if len(out["months"]) != 12:
+    raise RuntimeError("Kế hoạch nguồn thiếu tháng")
   plan = {}
   for m, row in zip(MONTHS, out["months"]):
-    c0, c1, c2, va, vb = row
-    win = 0 if c0 > 0 else (1 if c1 > 0 else (2 if c2 > 0 else None))
-    viirs = VIIRS_A if va > 0 else (VIIRS_B if vb > 0 else None)
-    plan[m] = {"s2_window": win, "viirs": viirs}
+    if any(v is None or v < 0 or v != int(v) for v in row):
+      raise RuntimeError("Số cảnh nguồn không hợp lệ")
+    if phase == "day":
+      c0, c1, c2, raw = row
+      win = 0 if c0 > 0 else (1 if c1 > 0 else (2 if c2 > 0 else None))
+      plan[m] = {"s2_window": win, "image_count": (c0, c1, c2)[win] if win is not None else 0,
+                 "indices_count": raw}
+    else:
+      va, vb = row
+      plan[m] = {"viirs": VIIRS_A if va > 0 else (VIIRS_B if vb > 0 else None),
+                 "image_count": va if va > 0 else vb, "indices_count": va if va > 0 else vb}
   return out["n_fc"], plan
 
 
@@ -462,7 +400,7 @@ def night_image(m, collection_id, commune_geom):
 
 
 # ---------- Task 1: notebook cell 15, gom 12 tháng thành 1 lần gọi ----------
-def task1_all_months(commune_fc):
+def task1_all_months(commune_fc, months=None):
   """Mỗi tháng: lọc CLOUDY_PIXEL_PERCENTAGE < 85, nếu rỗng thì dùng toàn bộ cảnh; median; add_indices;
   reduceRegions(mean + stdDev, scale 50, tileScale 4, EPSG:4326). Tháng không có cảnh nào: bỏ (như notebook).
   Nhánh if/else của notebook chuyển thành ee.Algorithms.If phía máy chủ, cùng điều kiện, cùng kết quả."""
@@ -470,7 +408,7 @@ def task1_all_months(commune_fc):
   reducers = ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True)
   selected_cols = ["GID_3"] + T1_FEATURES
   per_month = []
-  for m in MONTHS:
+  for m in MONTHS if months is None else months:
     s_date, e_date = _month_dates(YEAR, m)
     raw_col = ee.ImageCollection(S2_COLLECTION).filterBounds(commune_fc).filterDate(s_date, e_date)
     filtered_col = raw_col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 85))
@@ -610,16 +548,18 @@ def _dl_record(ok, err=None):
 
 
 def _http_get(url, timeout=600):
-    r = requests.get(url, timeout=timeout)
+    with REQUEST_GATE.slot('Image download'):
+        r = requests.get(url, timeout=timeout)
     if r.status_code in (401, 403) and EE_CREDENTIALS is not None:
         try:
             from google.auth.transport.requests import AuthorizedSession
-            r2 = AuthorizedSession(EE_CREDENTIALS).get(url, timeout=timeout)
+            with REQUEST_GATE.slot('Image download'):
+                r2 = AuthorizedSession(EE_CREDENTIALS).get(url, timeout=timeout)
             if r2.status_code < 400:
                 return r2
             r = r2
-        except Exception as exc:
-            log.debug(f"AuthorizedSession lỗi: {exc}")
+        except Exception:
+            log.debug("AuthorizedSession: lỗi truy cập, không ghi URL có chữ ký")
     return r
 
 
@@ -632,68 +572,50 @@ def _classify(msg):
     return "transient"
 
 
-def fetch_geotiff_bytes(img, region, scale, max_retry=4):
-    """Đúng tham số notebook cell 21. Trả bytes GeoTIFF; lỗi nào cũng kèm mã HTTP và nội dung."""
-    last = None
-    attempt, waited, rl = 0, 0.0, 0
-    while attempt < max_retry:
+def fetch_geotiff_bytes(img, region, scale, max_retry=None):
+    """v6 download parameters, with bounded retry/pacing shared across all workers."""
+    attempts = REQUEST_ATTEMPTS if max_retry is None else max_retry
+    for attempt in range(attempts):
         check_stop()
         try:
-            with EE_SEM:
+            with REQUEST_GATE.slot("Earth Engine"):
                 url = img.getDownloadURL({"region": region, "scale": scale, "crs": "EPSG:4326",
                                           "format": "GEO_TIFF", "filePerBand": False})
-        except ee.EEException as exc:
-            if is_rate_limited(exc) and waited <= RATE_LIMIT_MAX_WAIT_SEC:
-                waited = rate_limit_sleep(waited, rl)
-                rl += 1
-                last = f"429: {exc}"
-                continue
-            kind = _classify(str(exc))
-            if kind == "too_large":
-                raise TooLargeError(str(exc))
-            if kind == "permanent":
-                raise PermanentError(f"getDownloadURL bị từ chối: {exc}")
-            last = f"getDownloadURL: {exc}"
-            time.sleep(5 * (attempt + 1))
-            attempt += 1
-            continue
-        try:
-            with DL_SEM:
-                r = _http_get(url)
-        except requests.RequestException as exc:
-            last = f"mạng: {exc}"
-            time.sleep(5 * (attempt + 1))
-            attempt += 1
-            continue
-        if r.status_code >= 400:
-            body = (r.text or "")[:400].replace("\n", " ")
-            msg = f"HTTP {r.status_code}: {body}"
-            if (r.status_code == 429 or is_rate_limited(body)) and waited <= RATE_LIMIT_MAX_WAIT_SEC:
-                waited = rate_limit_sleep(waited, rl)
-                rl += 1
-                last = msg
-                continue
-            kind = _classify(msg) if r.status_code not in (401, 403) else "permanent"
-            if kind == "too_large":
-                raise TooLargeError(msg)
-            if kind == "permanent":
-                raise PermanentError(msg)
-            last = msg
-            time.sleep(5 * (attempt + 1))
-            attempt += 1
-            continue
-        data = r.content
-        if data[:2] == b"PK":                       # đôi khi EE trả về file zip (notebook cell 21)
-            z = zipfile.ZipFile(io.BytesIO(data))
-            data = z.read([n for n in z.namelist() if n.lower().endswith(".tif")][0])
-        if len(data) < 200:
-            last = f"file tải về chỉ {len(data)} byte"
-            time.sleep(5 * (attempt + 1))
-            attempt += 1
-            continue
-        EE_SEM.on_success()
-        return data
-    raise RuntimeError(f"Tải thất bại sau {max_retry} lần: {last}")
+            r = _http_get(url)
+            if r.status_code >= 400:
+                if r.status_code in (401, 403):
+                    raise PermanentError(f"Image download: HTTP {r.status_code}")
+                if _classify(r.text or "") == "too_large":
+                    raise TooLargeError("Image download: request too large")
+                r.raise_for_status()
+            data = r.content
+            if data[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    data = z.read(next(n for n in z.namelist() if n.lower().endswith(".tif")))
+            if len(data) < 200:
+                raise RuntimeError("Image download: file quá ngắn")
+            return data
+        except (PermanentError, TooLargeError):
+            raise
+        except Exception as exc:
+            code = status_code(exc)
+            message = re.sub(r'https?://\S+', '', str(exc))
+            if code != 429 and _classify(message) == "too_large":
+                raise TooLargeError("Earth Engine: request too large") from None
+            if code in (401, 403) or (code is None and _classify(message) == "permanent"):
+                raise PermanentError(f"Earth Engine: HTTP {code or 'permission'}") from None
+            if attempt == attempts - 1:
+                if code == 429:
+                    REQUEST_GATE.defer('Image download' if getattr(exc, 'response', None) is not None else 'Earth Engine', 0, True)
+                raise RuntimeError(f"Tải ảnh: HTTP {code or 'network/invalid file'}; hết {attempts} lần thử") from None
+            response = getattr(exc, "response", None)
+            header = response.headers.get("Retry-After") if response is not None else None
+            service = "Image download" if response is not None else "Earth Engine"
+            REQUEST_GATE.defer(service, retry_delay(attempt, header), code == 429)
+    raise RuntimeError("Không có lượt tải ảnh")
+
+
+# =====================================================================================
 
 
 def _grid_offset(a, b, res):
@@ -838,7 +760,7 @@ def _rewrite_bytes_to_tif(data, path, writer):
 
 
 def _bbox(region):
-    coords = region.bounds(maxError=1).getInfo()["coordinates"][0]
+    coords = ee_getinfo(region.bounds(maxError=1))["coordinates"][0]
     xs, ys = [c[0] for c in coords], [c[1] for c in coords]
     return min(xs), min(ys), max(xs), max(ys)
 
@@ -923,392 +845,24 @@ def _write_csv(df, path):
 
 
 # =====================================================================================
-# 7. XỬ LÝ MỘT XÃ
+# 7. ĐIỀU PHỐI V6: ngày → đêm, kiểm kê và chạy tiếp
 # =====================================================================================
-class NotInAsset(RuntimeError):
-    pass
-
-
-ADMIN_DF = None      # bảng hành chính GADM (vai trò gdf_cleaned trong notebook)
+ADMIN_DF = None
 ADMIN_BY_GID = {}
-_parts_lock = threading.Lock()
-PARTS_STAMP = None
+RCLONE_COMMON = ["--transfers", str(_env("VNGIS_RCLONE_TRANSFERS", 2, int)),
+                 "--checkers", str(_env("VNGIS_RCLONE_CHECKERS", 4, int)),
+                 "--tpslimit", str(_env("VNGIS_RCLONE_TPSLIMIT", 2.0, float)),
+                 "--tpslimit-burst", str(_env("VNGIS_RCLONE_TPSLIMIT_BURST", 2, int)),
+                 "--retries", "1", "--low-level-retries", "1"]
+if any(float(RCLONE_COMMON[i]) <= 0 for i in (1, 3, 5, 7)):
+    raise SystemExit('Giới hạn rclone phải > 0; không dùng TPS=0 để bỏ giới hạn')
 
 
-def append_parts(kind, records):
-    """Ghi chỉ số của 1 xã vào file .jsonl của lượt này; CSV toàn quốc được dựng lại từ các file này."""
-    with _parts_lock:
-        os.makedirs(L(D_PARTS), exist_ok=True)
-        with open(L(D_PARTS, f"{kind}_{PARTS_STAMP}.jsonl"), "a", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False, default=lambda o: None) + "\n")
+def _rclone(args, timeout=1200, quiet=False):
+    from v6_runtime import rclone_run
+    return rclone_run(args, timeout=timeout, allow_stopped=True).returncode == 0
 
 
-def _clean(v):
-    if isinstance(v, (np.floating, float)) and (v != v):
-        return None
-    if isinstance(v, np.generic):
-        return v.item()
-    return v
-
-
-def free_gb():
-    try:
-        return shutil.disk_usage(LOCAL_ROOT).free / 1e9
-    except OSError:
-        return 1e9
-
-
-def wait_for_disk():
-    """Hãm tốc độ: ổ máy chạy sắp đầy thì không tải thêm, yêu cầu đẩy ảnh lên Drive và chờ có chỗ."""
-    warned = False
-    while free_gb() < MIN_FREE_GB:
-        check_stop()
-        UPLOAD_NOW.set()
-        if not warned:
-            log.warning(f"Ổ máy chạy còn {free_gb():.1f} GB (< {MIN_FREE_GB} GB): tạm dừng tải, chờ đẩy ảnh lên Drive.")
-            warned = True
-        time.sleep(5)
-
-
-def _download_month(kind, ctx, m, img, path):
-    wait_for_disk()
-    label = f"[{ctx['gid3']}] {kind} {YEAR}-{m:02d}"
-    if kind == "day":
-        n = download_tif(img, img_region(ctx), 20, path, label,
-                         writer=write_day_int16 if DAY_FORMAT == "int16" else write_tif)
-        ok, empty, note = inspect_tif(path, DAY_BANDS)
-    else:
-        n = download_tif(img, img_region(ctx), 500, path, label, writer=write_tif)
-        ok, empty, note = inspect_tif(path, 2)
-    if not ok:
-        raise RuntimeError(f"file kiểm tra lỗi: {note}")
-    return n, empty
-
-
-def img_region(ctx):
-    return ctx["geom"]
-
-
-def process_commune(row, prev):
-    check_stop()
-    t_start = time.time()
-    ctx = build_ctx(row)
-    gid3 = ctx["gid3"]
-    prev = prev or {}
-    info = {"gid_3": gid3, "gid_1": ctx["gid1"], "run_id": RUN_ID,
-            "t1": prev.get("t1", "pending"), "t3csv": prev.get("t3csv", "pending"),
-            "t2": dict(prev.get("t2") or {}), "t3img": dict(prev.get("t3img") or {}),
-            "empty_months_t2": list(prev.get("empty_months_t2") or []),
-            "tiles_used": dict(prev.get("tiles_used") or {}), "day_bands": DAY_BANDS, "errors": []}
-
-    commune_fc = communes_fc.filter(ee.Filter.eq("GID_3", gid3))
-    commune_geom = commune_fc.geometry()
-    ctx["geom"] = commune_geom
-
-    # 3 lệnh gọi chạy song song: kế hoạch tải, Task 1 (12 tháng), Task 3.2 (12 tháng)
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"{gid3}-q") as qp:
-        f_plan = qp.submit(fetch_plan, commune_fc, commune_geom)
-        f_t1 = qp.submit(task1_all_months, commune_fc) if info["t1"] != "ok" else None
-        f_t3 = (qp.submit(task3_all_months, commune_geom, ctx["gid1"], ctx["name1"], gid3, ctx["cname_full"])
-                if info["t3csv"] != "ok" else None)
-        n_fc, plan = f_plan.result()
-        if n_fc == 0:
-            for f in (f_t1, f_t3):
-                if f:
-                    f.cancel()
-            raise NotInAsset(f"GID_3 {gid3} không có trong asset {ASSET_ID}")
-
-        # ---------- Task 2 + Task 3.1: tải song song tối đa MONTH_THREADS ảnh ----------
-        jobs = []
-        for m in MONTHS:
-            key = f"{m:02d}"
-            if info["t2"].get(key) not in ("ok", "none"):
-                w = plan[m]["s2_window"]
-                if w is None:
-                    info["t2"][key] = "none"           # notebook: "Bỏ qua tháng: không tìm thấy ảnh"
-                else:
-                    jobs.append(("day", m, day_image(m, w, commune_geom).select(DAY_BANDS_ALL[:DAY_BANDS]),
-                                 L(ctx["rel_day_dir"], day_name(ctx, m))))
-            if info["t3img"].get(key) not in ("ok", "none"):
-                c = plan[m]["viirs"]
-                if c is None:
-                    info["t3img"][key] = "none"
-                else:
-                    jobs.append(("night", m, night_image(m, c, commune_geom),
-                                 L(ctx["rel_night_dir"], night_name(ctx, m))))
-        with ThreadPoolExecutor(max_workers=max(1, MONTH_THREADS), thread_name_prefix=f"{gid3}-m") as mp:
-            futs = {mp.submit(_download_month, k, ctx, m, img, p): (k, m) for k, m, img, p in jobs}
-            for fut in as_completed(futs):
-                k, m = futs[fut]
-                key = f"{m:02d}"
-                slot = info["t2"] if k == "day" else info["t3img"]
-                try:
-                    n, empty = fut.result()
-                    slot[key] = "ok"
-                    if k == "day" and empty and key not in info["empty_months_t2"]:
-                        info["empty_months_t2"].append(key)
-                    if n > 1:
-                        info["tiles_used"][f"{k}_{key}"] = n
-                except StopRequested:
-                    raise
-                except PermanentError:
-                    raise
-                except Exception as exc:
-                    slot[key] = "fail"
-                    info["errors"].append(f"{k} {key}: {type(exc).__name__}: {str(exc)[:200]}")
-
-        # ---------- Task 1 ----------
-        if f_t1 is not None:
-            try:
-                props = f_t1.result()
-                if not props:
-                    raise RuntimeError("Task 1: không tháng nào có cảnh Sentinel-2")
-                adm = ADMIN_BY_GID.get(gid3)
-                if adm is None:
-                    raise RuntimeError("Task 1: GID_3 không có trong bảng GADM")
-                recs = []
-                for p in sorted(props, key=lambda p: p["MONTH"]):
-                    r = {k: adm[k] for k in ADM_COLS}           # = merge(lookup, df_s2, on="GID_3") của notebook
-                    r.update({k: _clean(p.get(k)) for k in T1_FEATURES})
-                    r.update({"YEAR": YEAR, "MONTH": int(p["MONTH"])})
-                    recs.append(r)
-                append_parts("day", recs)
-                info["t1"] = "ok"
-                info["t1_months"] = len(recs)
-            except StopRequested:
-                raise
-            except Exception as exc:
-                info["t1"] = "fail"
-                info["errors"].append(f"T1: {type(exc).__name__}: {str(exc)[:200]}")
-
-        # ---------- Task 3.2 ----------
-        if f_t3 is not None:
-            try:
-                df_ntl = f_t3.result()
-                append_parts("night", [{k: _clean(v) for k, v in r.items()} for r in df_ntl.to_dict("records")])
-                info["t3csv"] = "ok"
-                info["t3_months"] = int(len(df_ntl))
-            except StopRequested:
-                raise
-            except Exception as exc:
-                info["t3csv"] = "fail"
-                info["errors"].append(f"T3csv: {type(exc).__name__}: {str(exc)[:200]}")
-
-    core_ok = (info["t1"] == "ok" and info["t3csv"] == "ok"
-               and all(info["t2"].get(f"{m:02d}") in ("ok", "none") for m in MONTHS)
-               and all(info["t3img"].get(f"{m:02d}") in ("ok", "none") for m in MONTHS))
-    info["status"] = "done" if core_ok else "partial"
-    info["seconds"] = round(time.time() - t_start, 1)
-    info["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return info
-
-
-# =====================================================================================
-# 7b. CSV TOÀN QUỐC (dựng lại từ _control/parts sau mỗi lượt)
-# =====================================================================================
-def _read_parts(kind):
-    rows = []
-    for p in sorted(glob.glob(L(D_PARTS, f"{kind}_*.jsonl"))):
-        with open(p, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    continue
-    return rows
-
-
-def build_national_csv():
-    os.makedirs(L(D_CSV), exist_ok=True)
-    for kind, rel, cols in (("day", DAY_CSV, DAY_COLUMNS), ("night", NIGHT_CSV, NIGHT_COLUMNS)):
-        rows = _read_parts(kind)
-        if not rows:
-            continue
-        df = pd.DataFrame(rows).reindex(columns=cols)
-        df = df.drop_duplicates(subset=["GID_3", "MONTH"], keep="last")
-        for c in ("YEAR", "MONTH", "LIT_PIXELS"):
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-        df["_k"] = df["GID_3"].map(lambda g: tuple(natural_sort_key(g)))
-        df = df.sort_values(["_k", "MONTH"]).drop(columns="_k")
-        path = L(rel)
-        df.to_csv(path + ".part", index=False, encoding="utf-8-sig")
-        os.replace(path + ".part", path)
-        log.info(f"{rel}: {len(df):,} dòng, {df['GID_3'].nunique():,} xã")
-
-
-# =====================================================================================
-# 8. TRẠNG THÁI (mỗi lượt một file .jsonl trong _control/status, bản ghi sau cùng thắng)
-# =====================================================================================
-_status_lock = threading.Lock()
-STATUS_FILE = None
-
-
-def write_status(info):
-    line = json.dumps(info, ensure_ascii=False, default=str)
-    with _status_lock:
-        os.makedirs(L(D_STATUS), exist_ok=True)
-        with open(STATUS_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
-
-def load_all_status():
-    out = {}
-    for p in sorted(glob.glob(L(D_STATUS, "status_*.jsonl"))):
-        try:
-            with open(p, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(d, dict) and "gid_3" in d:
-                        out[d["gid_3"]] = d
-        except OSError:
-            continue
-    return out
-
-
-def reconcile_with_drive(statuses, rows):
-    """Xã ghi 'ok' cho một tháng mà ảnh không có trên Drive (ví dụ lượt trước chết khi ảnh chưa kịp đẩy lên):
-    đặt lại tháng đó để làm lại. Liệt kê tên file trên Drive một lần cho cả Day và Night."""
-    names = set()
-    for d in (D_DAY, D_NIGHT):
-        res = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--fast-list", "--include", "*.tif",
-                              f"{REMOTE_BASE}/{d}"], capture_output=True, text=True, timeout=3600)
-        if res.returncode != 0 and "directory not found" not in res.stderr:
-            raise RuntimeError(f"Không liệt kê được {d} trên Drive: {res.stderr.strip()[-300:]}")
-        names.update(os.path.basename(x.strip()) for x in res.stdout.splitlines() if x.strip())
-    fixed = 0
-    for gid, st in list(statuses.items()):
-        if gid not in rows or not st:
-            continue
-        ctx = build_ctx(rows[gid])
-        missing = []
-        for key_slot, namer, tag in (("t2", day_name, "day"), ("t3img", night_name, "night")):
-            slot = dict(st.get(key_slot) or {})
-            for key, v in slot.items():
-                if v == "ok" and namer(ctx, int(key)) not in names and not os.path.isfile(
-                        L(ctx["rel_day_dir" if tag == "day" else "rel_night_dir"], namer(ctx, int(key)))):
-                    slot[key] = "missing"
-                    missing.append(f"{tag} {key}")
-            st[key_slot] = slot
-        if missing:
-            st["status"] = "partial"
-            st["attempts"] = min(int(st.get("attempts", 0)), MAX_ATTEMPTS - 1)
-            st["errors"] = [f"Thiếu trên Drive, làm lại: {', '.join(missing)}"]
-            st["run_id"] = RUN_ID
-            write_status(st)
-            fixed += 1
-    log.info(f"Đối chiếu Drive: {len(names):,} ảnh có trên Drive; {fixed:,} xã thiếu ảnh được đặt làm lại.")
-    return fixed
-
-
-def core_finished(st):
-    if not st:
-        return False
-    if st.get("status") in ("done", "not_in_asset"):
-        return True
-    # Lỗi do vượt hạn mức Earth Engine (429) là lỗi tạm thời: không tính vào số lần thử, luôn làm lại
-    if is_rate_limited(" ".join(st.get("errors") or [])):
-        return False
-    return int(st.get("attempts", 0)) >= MAX_ATTEMPTS
-
-
-
-# =====================================================================================
-# 9. RCLONE
-# =====================================================================================
-RCLONE_COMMON = ["--transfers", str(RCLONE_TRANSFERS), "--checkers", "16", "--tpslimit", "12",
-                 "--retries", "5", "--low-level-retries", "20", "--stats-log-level", "NOTICE"]
-
-
-def _rclone(args, timeout=6 * 3600, quiet=False):
-    try:
-        res = subprocess.run(["rclone", *args], capture_output=True, text=True, timeout=timeout)
-    except Exception as exc:
-        log.warning(f"rclone {' '.join(args[:2])} lỗi: {exc}")
-        return False
-    if res.returncode != 0 and not quiet:
-        log.warning(f"rclone {' '.join(args[:3])} lỗi: {res.stderr.strip()[-400:]}")
-    return res.returncode == 0
-
-
-_sync_lock = threading.Lock()
-
-
-def rclone_sync_once(final=False):
-    """TIF: move (rclone chỉ xóa bản trên máy sau khi đã kiểm tra kích thước/hash bản trên Drive).
-    CSV, trạng thái, log: copy."""
-    if not os.path.isdir(LOCAL_ROOT):
-        return
-    with _sync_lock:
-        age = [] if final else ["--min-age", "30s"]
-        for d in (D_DAY, D_NIGHT):
-            src = L(d)
-            if os.path.isdir(src):
-                _rclone(["move", src, f"{REMOTE_BASE}/{d}", "--filter", "- *.part", "--filter", "+ *.tif",
-                         "--filter", "- *", *age, *RCLONE_COMMON])
-        for d in (D_CSV, D_CONTROL):
-            src = L(d)
-            if os.path.isdir(src):
-                _rclone(["copy", src, f"{REMOTE_BASE}/{d}", "--filter", "- *.part", *RCLONE_COMMON])
-
-
-class Uploader(threading.Thread):
-    def __init__(self):
-        super().__init__(name="uploader", daemon=True)
-        self.stop_event = threading.Event()
-
-    def run(self):
-        last_stop_check = 0
-        while not self.stop_event.wait(5):
-            now = time.time()
-            if now - last_stop_check >= DRIVE_STOP_POLL_SEC:
-                last_stop_check = now
-                if drive_stop_exists():
-                    request_stop("drive_stop")
-            if UPLOAD_NOW.is_set() or now - getattr(self, "_last_sync", 0) >= UPLOAD_EVERY_SEC:
-                UPLOAD_NOW.clear()
-                self._last_sync = now
-                try:
-                    rclone_sync_once()
-                    log.info("Đã đồng bộ lên Drive (định kỳ).")
-                except Exception as exc:
-                    log.warning(f"Đồng bộ định kỳ lỗi: {exc}")
-
-
-def drive_stop_exists():
-    try:
-        res = subprocess.run(["rclone", "lsf", f"{REMOTE_BASE}/{D_CONTROL}", "--files-only"],
-                             capture_output=True, text=True, timeout=120)
-        return res.returncode == 0 and "STOP" in [x.strip() for x in res.stdout.splitlines()]
-    except Exception:
-        return False
-
-
-def init_storage():
-    for d in (LOCAL_ROOT, L(D_STATUS), L(D_PARTS), L(D_LOGS), CACHE_DIR):
-        os.makedirs(d, exist_ok=True)
-    if shutil.which("rclone") is None:
-        raise RuntimeError("Chưa cài rclone.")
-    if not _rclone(["mkdir", f"{REMOTE_BASE}/{D_STATUS}"], timeout=180):
-        raise RuntimeError(f"rclone không ghi được vào '{REMOTE_BASE}'. Kiểm tra secret RCLONE_CONF.")
-    for d in (D_STATUS, D_PARTS):        # vài file nhỏ: trạng thái và chỉ số của các lượt trước
-        res = subprocess.run(["rclone", "copy", f"{REMOTE_BASE}/{d}", L(d), "--update"],
-                             capture_output=True, text=True, timeout=3600)
-        if res.returncode != 0 and "directory not found" not in res.stderr:
-            raise RuntimeError(f"Không kéo được {d} từ Drive: {res.stderr.strip()[-300:]}")
-    # Cảnh báo nếu đích còn cấu trúc của bản pipeline cũ
-    old = subprocess.run(["rclone", "lsf", REMOTE_BASE, "--dirs-only"], capture_output=True, text=True, timeout=120)
-    if any(x.strip("/") in ("03_Provinces", "04_Status", "1_Task1_Spectral_Indices", "2_Task2_Day_S2")
-           for x in old.stdout.splitlines()):
-        log.warning(f"Thư mục '{DRIVE_FOLDER}' trên Drive còn dữ liệu của bản pipeline cũ. "
-                    f"Nên xóa thư mục cũ rồi chạy lại để không lẫn dữ liệu.")
-
-
-# =====================================================================================
 # =====================================================================================
 # 10. DANH SÁCH XÃ (GADM 4.1, giống notebook cell 3; đọc thẳng file .dbf, không cần geopandas)
 # =====================================================================================
@@ -1339,14 +893,9 @@ def read_dbf(path, encoding="utf-8"):
 
 
 def build_admin_table():
-    custom = os.environ.get('VNGIS_ADMIN_FILE')
-    if custom:
-        import data_contract as D
-        table = D.administrative_table(pd.read_csv(custom, dtype=str, keep_default_na=False))
-        return table.rename(columns={c: c.upper() for c in D.ADMIN_COLUMNS})
     idx_csv = os.path.join(CACHE_DIR, "gadm41_VNM_3_admin.csv")
     if os.path.isfile(idx_csv):
-        return pd.read_csv(idx_csv, dtype=str, keep_default_na=False)
+        return D.administrative_table(pd.read_csv(idx_csv, dtype=str, keep_default_na=False)).rename(columns=str.upper)
     os.makedirs(CACHE_DIR, exist_ok=True)
     zip_path = os.path.join(CACHE_DIR, "gadm41_VNM_shp.zip")
     if not os.path.isfile(zip_path):
@@ -1363,9 +912,9 @@ def build_admin_table():
         cpg = "gadm41_VNM_3.cpg"
         enc = z.read(cpg).decode().strip() if cpg in z.namelist() else "utf-8"
     enc = "utf-8" if enc.upper().replace("-", "") in ("UTF8", "") else enc
-    tbl = read_dbf(os.path.join(CACHE_DIR, "gadm41_VNM_3.dbf"), enc)[ADM_COLS].drop_duplicates("GID_3")
+    tbl = read_dbf(os.path.join(CACHE_DIR, "gadm41_VNM_3.dbf"), enc)[ADM_COLS]
     tbl.to_csv(idx_csv, index=False, encoding="utf-8-sig")
-    return pd.read_csv(idx_csv, dtype=str, keep_default_na=False)
+    return D.administrative_table(pd.read_csv(idx_csv, dtype=str, keep_default_na=False)).rename(columns=str.upper)
 
 
 def natural_sort_key(gid_str):
@@ -1396,315 +945,17 @@ def load_targets(admin):
 
 # =====================================================================================
 # =====================================================================================
-# 11. PREFLIGHT
+# 11. ENTRYPOINT (luồng trực tiếp v6, không gọi batch export)
 # =====================================================================================
-class PreflightError(RuntimeError):
-    pass
-
-
-PREFLIGHT_HINT = (
-    "Gợi ý: (1) HTTP 401/403 hoặc 'permission': cấp role 'Earth Engine Resource Writer' (roles/earthengine.writer) "
-    "và 'Service Usage Consumer' (roles/serviceusage.serviceUsageConsumer) cho service account, đăng ký project "
-    "với Earth Engine; (2) thử VNGIS_EE_HIGH_VOLUME=true nếu standard bị chặn; (3) lỗi rclone: kiểm tra RCLONE_CONF.")
-
-
-def _probe_drive():
-    probe = L(D_CONTROL, "preflight_probe.txt")
-    stamp = f"{RUN_ID} {datetime.now(timezone.utc).isoformat()}"
-    with open(probe, "w", encoding="utf-8") as f:
-        f.write(stamp)
-    if not _rclone(["copyto", probe, f"{REMOTE_BASE}/{D_CONTROL}/preflight_probe.txt"], timeout=300):
-        raise PreflightError("rclone không ghi được lên Drive.")
-    res = subprocess.run(["rclone", "cat", f"{REMOTE_BASE}/{D_CONTROL}/preflight_probe.txt"],
-                         capture_output=True, text=True, timeout=300)
-    if res.returncode != 0 or res.stdout.strip() != stamp:
-        raise PreflightError(f"Đọc lại file thử trên Drive không khớp: {res.stderr.strip()[-200:]}")
-    return "Drive OK"
-
-
-def _probe_ee(row):
-    gid3 = row["GID_3"]
-    fc = communes_fc.filter(ee.Filter.eq("GID_3", gid3))
-    geom = fc.geometry()
-    n_fc, plan = fetch_plan(fc, geom)
-    if n_fc == 0:
-        raise PreflightError(f"Asset không có xã {gid3}. Kiểm tra GID_3 trong asset có khớp GADM 4.1 không.")
-    region = geom.centroid(maxError=1).buffer(1500)
-    m_day = next((m for m in MONTHS if plan[m]["s2_window"] is not None), None)
-    m_night = next((m for m in MONTHS if plan[m]["viirs"] is not None), None)
-    if m_day is None or m_night is None:
-        raise PreflightError(f"Xã thử {gid3} không có ảnh Sentinel-2 hoặc VIIRS nào trong năm {YEAR}.")
-    img = day_image(m_day, plan[m_day]["s2_window"], geom).select(DAY_BANDS_ALL[:DAY_BANDS]).clip(region)
-    try:
-        whole = fetch_geotiff_bytes(img, region, 20)
-        night = fetch_geotiff_bytes(night_image(m_night, plan[m_night]["viirs"], geom).clip(region), region, 500)
-    except Exception as exc:
-        raise PreflightError(f"Tải ảnh thử thất bại: {exc}")
-    import rasterio
-    with rasterio.MemoryFile(whole) as mf, mf.open() as src:
-        if src.count != DAY_BANDS:
-            raise PreflightError(f"Ảnh ngày có {src.count} kênh, cần {DAY_BANDS}.")
-        a_whole, tr_whole = src.read(), src.transform
-    msg = f"ảnh ngày {len(whole)/1024:.0f} KB, ảnh đêm {len(night)/1024:.0f} KB"
-    if PREFLIGHT_TILE_TEST:
-        try:
-            parts = [fetch_geotiff_bytes(img, rect, 20) for rect in _split_bbox(_bbox(region), 2)]
-            a_tiled, tr_tiled, *_ = mosaic_tiles(parts)
-            compare_on_grid(a_whole, tr_whole, a_tiled, tr_tiled)
-            msg += "; chia ô trùng khớp từng pixel"
-        except Exception as exc:
-            TILING_OK[0] = False
-            log.error(f"[preflight] Kiểm tra chia ô KHÔNG ĐẠT ({exc}). Xã cần chia ô sẽ báo lỗi thay vì ghép sai.")
-    else:
-        msg += "; bỏ qua kiểm tra chia ô (chế độ thí điểm)"
-    return msg
-
-
-def preflight(row):
-    """Kiểm tra Earth Engine và Drive song song."""
-    log.info(f"[preflight] Kiểm tra Earth Engine (xã {row['GID_3']}) và Google Drive...")
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_ee, f_dr = ex.submit(_probe_ee, row), ex.submit(_probe_drive)
-        msg_ee, msg_dr = f_ee.result(), f_dr.result()
-    log.info(f"[preflight] ĐẠT: {msg_ee}; {msg_dr}.")
-
-
-# =====================================================================================
-# 12. TIẾN ĐỘ
-# =====================================================================================
-def write_progress(targets, statuses):
-    rows = []
-    for r in targets.itertuples():
-        st = statuses.get(r.GID_3) or {}
-        t2 = st.get("t2") or {}
-        t3 = st.get("t3img") or {}
-        rows.append({"GID_1": r.GID_1, "NAME_1": r.NAME_1, "GID_3": r.GID_3, "NAME_3": r.NAME_3,
-                     "status": st.get("status", "pending"), "attempts": st.get("attempts", 0),
-                     "t1": st.get("t1"), "t2_ok": sum(v == "ok" for v in t2.values()),
-                     "t2_none": sum(v == "none" for v in t2.values()),
-                     "t3img_ok": sum(v == "ok" for v in t3.values()), "t3csv": st.get("t3csv"),
-                     "seconds": st.get("seconds"), "finished_at": st.get("finished_at"),
-                     "errors": " | ".join(st.get("errors") or [])[:500]})
-    df = pd.DataFrame(rows)
-    _write_csv(df, L(D_CONTROL, "progress.csv"))
-    return df
-
-
-# 13. VÒNG CHẠY
-# =====================================================================================
-OUTAGE_STREAK = 10
-OUTAGE_SLEEP_SEC = 900
-MAX_OUTAGES = 8
-
-
-def run_round(jobs, statuses):
-    """jobs: list (gid, row, kind)."""
-    t0 = time.time()
-    done_now = 0
-    pending_fail = []
-    outage = False
-    pool = ThreadPoolExecutor(max_workers=N_WORKERS, thread_name_prefix="w")
-    futures = {}
-    for gid, row, kind in jobs:
-        futures[pool.submit(process_commune, row, statuses.get(gid))] = (gid, kind)
-    handled = set()
-
-    def consume(fut):
-        nonlocal done_now
-        handled.add(fut)
-        if fut.cancelled():
-            return
-        gid, kind = futures[fut]
-        prev = statuses.get(gid) or {}
-        attempts = int(prev.get("attempts", 0)) + 1
-        try:
-            info = fut.result()
-        except StopRequested:
-            return
-        except NotInAsset as exc:
-            info = {"gid_3": gid, "status": "not_in_asset", "attempts": MAX_ATTEMPTS, "errors": [str(exc)],
-                    "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-            statuses[gid] = info
-            write_status(info)
-            log.error(f"[{gid}] {exc}")
-            return
-        except PermanentError as exc:
-            log.error(f"[{gid}] lỗi quyền truy cập: {exc}")
-            _dl_record(False, exc)
-            pending_fail.append((gid, exc, attempts))
-            return
-        except Exception as exc:
-            pending_fail.append((gid, exc, attempts))
-            log.warning(f"[{gid}] lỗi: {type(exc).__name__}: {str(exc)[:200]}")
-            return
-        for g, e, a in pending_fail:
-            statuses[g] = _fail_info(g, e, a, statuses.get(g))
-            write_status(statuses[g])
-        pending_fail.clear()
-        info["attempts"] = attempts
-        statuses[gid] = info
-        write_status(info)
-        done_now += 1
-        errs = f" | lỗi: {info['errors'][:2]}" if info.get("errors") else ""
-        t2 = info.get("t2") or {}
-        log.info(f"[{gid}] {kind} -> {info.get('status')} | T1={info.get('t1')} "
-                 f"T2={sum(v == 'ok' for v in t2.values())}/12 T3img={sum(v == 'ok' for v in (info.get('t3img') or {}).values())}/12 "
-                 f"T3csv={info.get('t3csv')} | {info.get('seconds', 0)}s | lần {attempts}{errs}")
-        if done_now % 20 == 0:
-            rate = done_now / max(time.time() - t0, 1)
-            log.info(f"Tiến độ vòng: {done_now}/{len(jobs)} | {rate*3600:.0f} việc/giờ")
-
-    try:
-        for fut in as_completed(futures):
-            consume(fut)
-            if len(pending_fail) >= OUTAGE_STREAK:
-                log.error(f"{OUTAGE_STREAK} xã lỗi liên tiếp: nghi sự cố chung, tạm dừng vòng.")
-                outage = True
-                break
-    except BaseException:
-        pool.shutdown(wait=False, cancel_futures=True)
-        raise
-    pool.shutdown(wait=True, cancel_futures=True)
-    for fut in futures:
-        if fut not in handled and fut.done():
-            consume(fut)
-    if outage:
-        return "outage"
-    for g, e, a in pending_fail:
-        statuses[g] = _fail_info(g, e, a, statuses.get(g))
-        write_status(statuses[g])
-    return "stop" if STOP_EVENT.is_set() else "ok"
-
-
-def _fail_info(gid, exc, attempts, prev):
-    info = dict(prev or {})
-    info.update({"gid_3": gid, "status": "failed", "attempts": attempts, "run_id": RUN_ID,
-                 "errors": [f"{type(exc).__name__}: {str(exc)[:300]}"],
-                 "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
-    return info
-
-
 def main():
-    global STATUS_FILE, ADMIN_DF, ADMIN_BY_GID, PARTS_STAMP
-    os.makedirs(L(D_STATUS), exist_ok=True)
-    PARTS_STAMP = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{RUN_ID}"
-    STATUS_FILE = L(D_STATUS, f"status_{PARTS_STAMP}.jsonl")
-    setup_logging()
-    log.info(f"VNGISDash {YEAR} | chế độ {MODE} | đích {REMOTE_BASE} | {N_WORKERS} xã x {MONTH_THREADS} ảnh song song"
-             f" | ảnh ngày {DAY_BANDS} kênh {DAY_FORMAT}")
-    try:
-        # Khởi tạo Earth Engine song song với việc kéo trạng thái từ Drive
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_ee = ex.submit(init_earth_engine)
-            init_storage()
-            ADMIN_DF = build_admin_table()
-            f_ee.result()
-        ADMIN_BY_GID = {r["GID_3"]: r for r in ADMIN_DF.to_dict("records")}
-        targets = load_targets(ADMIN_DF)
-    except Exception as exc:
-        log.error(f"Khởi tạo thất bại: {type(exc).__name__}: {exc}")
-        log.error(PREFLIGHT_HINT)
-        return 1
-    rows = {r["GID_3"]: r for r in targets.to_dict("records")}
-    gids = list(rows)
-    log.info(f"Danh sách: {len(gids):,} xã, {targets['GID_1'].nunique()} tỉnh"
-             + (f" (thí điểm: {', '.join(gids)})" if MODE == "pilot" else ""))
-
-    statuses = load_all_status()
-    try:
-        if statuses:
-            reconcile_with_drive(statuses, rows)
-            statuses = load_all_status()
-    except Exception as exc:
-        log.error(f"Đối chiếu ảnh trên Drive thất bại: {exc}. Dừng để không bỏ sót xã thiếu ảnh.")
-        return 1
-    if PREFLIGHT:
-        pend = [g for g in gids if not core_finished(statuses.get(g))] or gids
-        for attempt in (1, 2, 3):
-            try:
-                preflight(rows[pend[0]])
-                break
-            except Exception as exc:
-                log.error(f"[preflight] THẤT BẠI (lần {attempt}/3): {type(exc).__name__}: {exc}")
-                if isinstance(exc, PreflightError) or _classify(str(exc)) == "permanent":
-                    log.error(PREFLIGHT_HINT)
-                    rclone_sync_once(final=True)
-                    return 1
-                if attempt == 3:
-                    log.error(PREFLIGHT_HINT)
-                    rclone_sync_once(final=True)
-                    return 1
-                time.sleep(20 * attempt)
-
-    install_signal_handlers()
-    if MAX_RUNTIME_SEC > 0:
-        t = threading.Timer(MAX_RUNTIME_SEC, request_stop, args=("deadline",))
-        t.daemon = True
-        t.start()
-        log.info(f"Thời gian tối đa của lượt: {MAX_RUNTIME_SEC/3600:.2f} giờ")
-    if drive_stop_exists():
-        log.warning("Có file _control/STOP trên Drive: không chạy.")
-        return 130
-
-    uploader = Uploader()
-    uploader.start()
-    outages, code = 0, 0
-    try:
-        while not STOP_EVENT.is_set():
-            statuses = load_all_status()
-            write_progress(targets, statuses)
-            jobs = [(g, rows[g], "full") for g in gids if not core_finished(statuses.get(g))]
-            if not jobs:
-                break
-            log.info(f"Vòng mới: {len(jobs):,} xã cần xử lý")
-            result = run_round(jobs, statuses)
-            if result == "stop":
-                break
-            if result == "outage":
-                outages += 1
-                if outages >= MAX_OUTAGES:
-                    code = 2
-                    break
-                STOP_EVENT.wait(OUTAGE_SLEEP_SEC)
-            else:
-                outages = 0
-    except KeyboardInterrupt:
-        code = 130
-    finally:
-        uploader.stop_event.set()
-        uploader.join(timeout=60)
-
-    statuses = load_all_status()
-    progress = write_progress(targets, statuses)
-    unfinished = [g for g in gids if not core_finished(statuses.get(g))]
-    try:
-        build_national_csv()
-    except Exception as exc:
-        log.error(f"Dựng CSV toàn quốc lỗi: {exc}")
-    rclone_sync_once(final=True)
-
-    if not unfinished and not STOP_EVENT.is_set():
-        failed = progress[progress["status"] != "done"]
-        log.info(f"HOÀN TẤT: {progress['status'].value_counts().to_dict()}")
-        if len(failed):
-            log.warning(f"{len(failed)} xã không đạt sau {MAX_ATTEMPTS} lần, xem _control/progress.csv")
-        return code or 0
-
-    log.info(f"Chưa xong: còn {len(unfinished):,} xã | {progress['status'].value_counts().to_dict()}")
-    if code:
-        return code
-    if STOP_REASON[0] == "fatal":
-        log.error(f"Dừng vì lỗi tải ảnh. Lỗi gần nhất: {_dl_stats['last_err']}")
-        log.error(PREFLIGHT_HINT)
-        return 1
-    if STOP_REASON[0] in ("signal", "drive_stop"):
-        return 130
-    return 3
+    import argparse
+    from v6_runtime import main as run
+    parser = argparse.ArgumentParser()
+    parser.add_argument("step", nargs="?", choices=["run", "inventory"], default="run")
+    parser.add_argument("--sync-only", action="store_true")
+    args = parser.parse_args()
+    return run(sys.modules[__name__], step=args.step, sync_only=args.sync_only)
 
 
 if __name__ == "__main__" and os.environ.get("VNGIS_SKIP_MAIN") != "1":
-    # Keep the scientific functions importable; retire the mixed day/night CLI.
-    import process_exports
-    if len(sys.argv) == 1:
-        sys.argv.append('day')
-    sys.exit(process_exports.main())
+    sys.exit(main())

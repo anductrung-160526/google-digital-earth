@@ -26,7 +26,6 @@ TERMINAL = {'done', 'no_source'}
 STATES = {'pending', 'running', 'done', 'no_source', 'failed'}
 IMAGE_RE = re.compile(r'^(.+)_(day|night)_2024(0[1-9]|1[0-2])\.tif$')
 VALIDATION_VERSION = 1
-_LOCAL_IMAGE_CACHE = {}
 
 
 def natural_key(gid):
@@ -204,28 +203,16 @@ def validate_image(path, kind):
         return 'failed', f'{type(exc).__name__}: {exc}'
 
 
-def plan_sources(plan):
-    out = {}
-    for gid, months in plan.items():
-        if len(months) != 12:
-            raise ValueError(f'Kế hoạch {gid} thiếu tháng')
-        for m, counts in enumerate(months, 1):
-            if len(counts) != 3 or any(not isinstance(v, (int, float)) or not np.isfinite(v)
-                                       or v < 0 or v != int(v) for v in counts):
-                raise ValueError(f'Kế hoạch {gid}/{m} sai số cảnh')
-            out[gid, m, 'day_image'] = next((v for v in counts if v > 0), 0)
-    return out
-
-
 def read_sources(path):
     if not Path(path).is_file():
         return {}
     df = pd.read_csv(path, dtype={'gid_3': str})
     if not set(KEY + ['field', 'count']).issubset(df):
         raise ValueError('source_counts.csv sai cấu trúc')
+    df['count'] = pd.to_numeric(df['count'], errors='raise').astype(float)
     if not df['year'].eq(YEAR).all() or not df['month'].isin(MONTHS).all() or not df['field'].isin(FIELDS).all():
         raise ValueError('source_counts.csv sai năm/tháng/field')
-    if df['count'].isna().any() or not np.isfinite(df['count']).all() or (df['count'] < 0).any():
+    if df['count'].isna().any() or not np.isfinite(df['count']).all() or (df['count'] < 0).any() or df['count'].mod(1).ne(0).any():
         raise ValueError('source_counts.csv thiếu/sai số cảnh')
     df = df.drop_duplicates()
     if df.duplicated(KEY + ['field']).any():
@@ -275,37 +262,3 @@ def require_day_complete(table):
     blocked = ~table[['day_image', 'day_indices']].isin(TERMINAL).all(axis=1)
     if blocked.any():
         raise RuntimeError(f'Chặn phần đêm: {int(blocked.sum())} xã–tháng ngày còn thiếu/lỗi')
-
-
-def scan_local(root, admin, plan=None):
-    """Colab/mounted Drive: independently verify actual files before export submission."""
-    root = Path(root)
-    if not root.is_dir():
-        raise RuntimeError(f'Không đọc được thư mục đích {root}; mount Drive trước')
-    frames = {}
-    for kind in ['day', 'night']:
-        path = root / 'CSV' / f'{kind}_indices.csv'
-        frames[kind] = pd.read_csv(path) if path.is_file() else pd.DataFrame(columns=COLUMNS[kind])
-    sources = read_sources(root / '_control/source_counts.csv')
-    sources.update(plan_sources(plan or {}))
-    mapping = {g.replace('.', '_'): g for g in administrative_table(admin, None)['gid_3']}
-    images = {}
-    for kind in ['day', 'night']:
-        for path in (root / kind.title()).rglob('*.tif'):
-            match = IMAGE_RE.match(path.name)
-            if match and match[2] == kind and match[1] in mapping:
-                key = (kind, mapping[match[1]], int(match[3]))
-                if key in images:
-                    images[key] = 'failed', 'Có nhiều file cùng xã/tháng'
-                else:
-                    stat = path.stat()
-                    fingerprint = stat.st_size, stat.st_mtime_ns, stat.st_ino, VALIDATION_VERSION
-                    cached = _LOCAL_IMAGE_CACHE.get(str(path.resolve()))
-                    if cached and cached[0] == fingerprint:
-                        images[key] = cached[1]
-                    else:
-                        images[key] = validate_image(path, kind)
-                        _LOCAL_IMAGE_CACHE[str(path.resolve())] = fingerprint, images[key]
-    checkpoint = root / '_control/progress.csv'
-    previous = pd.read_csv(checkpoint) if checkpoint.is_file() else None
-    return progress(admin, frames, images, sources, previous)
