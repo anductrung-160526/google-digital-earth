@@ -193,6 +193,47 @@ def _short(note, limit=3):
     return "; ".join(parts)
 
 
+def summarize_progress(root, pipeline_code=None):
+    """Read-only diagnostics, including when inventory stopped on a legacy CSV.
+
+    This report never validates artifacts or changes the pipeline exit code.
+    Legacy commune status must not be presented as verified monthly completion.
+    """
+    root = Path(root)
+    lines = [f"### Tiến độ ({root.name})", ""]
+    if pipeline_code is not None and str(pipeline_code) != '':
+        lines += [f"Mã thoát pipeline: `{pipeline_code}`.", ""]
+    path = root/'_control/progress.csv'
+    if not path.is_file():
+        return '\n'.join(lines + ["Cảnh báo: chưa có progress.csv; kiểm kê có thể chưa hoàn tất.", ""])
+    try:
+        frame = D.aliases(pd.read_csv(path))
+    except (OSError, ValueError, pd.errors.ParserError, UnicodeError) as exc:
+        return '\n'.join(lines + [f"Cảnh báo: không đọc được progress.csv ({type(exc).__name__}). "
+                                   "Xem log Chạy pipeline; bảng chưa được xác minh.", ""])
+    if 'gid_3' not in frame:
+        return '\n'.join(lines + ["Cảnh báo: progress.csv thiếu gid_3/GID_3; bảng chưa được xác minh.", ""])
+    lines += [f"Tổng {frame['gid_3'].nunique():,} xã, {len(frame):,} dòng tiến độ.", ""]
+    if not set(D.KEY + D.FIELDS).issubset(frame):
+        lines += ["Cảnh báo: bảng tiến độ cũ hoặc thiếu cột xã–tháng. "
+                  "Chưa thể thống kê bốn phần ngày/đêm; không coi trạng thái cũ done là hoàn tất.", ""]
+        return '\n'.join(lines)
+    invalid = (frame['gid_3'].isna() | frame['gid_3'].astype(str).str.strip().eq('') |
+               ~frame['year'].eq(D.YEAR) | ~frame['month'].isin(D.MONTHS))
+    if invalid.any() or frame.duplicated(D.KEY).any():
+        lines += ["Cảnh báo: khóa xã–tháng bị thiếu, sai hoặc trùng; bảng chưa được xác minh.", ""]
+        return '\n'.join(lines)
+    if frame.empty or not frame.groupby('gid_3').size().eq(12).all():
+        lines += ["Cảnh báo: chưa đủ 12 dòng tháng năm 2024 cho mỗi xã.", ""]
+    if not frame[D.FIELDS].isin(D.STATES).all().all():
+        lines += ["Cảnh báo: bảng có trạng thái trống hoặc không hợp lệ.", ""]
+    lines += [f"{len(frame):,} xã–tháng. Đây là trạng thái ghi trong bảng; "
+              "lượt chạy tiếp vẫn kiểm tra file thực tế.", ""]
+    for field in D.FIELDS:
+        lines.append(f"- {field}: {frame[field].value_counts(dropna=False).to_dict()}")
+    return '\n'.join(lines) + '\n'
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root")
@@ -202,11 +243,16 @@ def main():
     ap.add_argument("--notebook-gid", default="")
     ap.add_argument("--report", default="")
     ap.add_argument("--self-test", action="store_true", help="Chạy kiểm thử offline v6, không truy cập Google")
+    ap.add_argument("--progress-summary", action="store_true", help="Tóm tắt chỉ đọc, hỗ trợ bảng tiến độ cũ")
+    ap.add_argument("--pipeline-code", default=None, help="Mã thoát pipeline để hiển thị trong tóm tắt")
     a = ap.parse_args()
     if a.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         raise SystemExit(0 if result.wasSuccessful() else 1)
+    if a.progress_summary:
+        print(summarize_progress(a.root or V.LOCAL_ROOT, a.pipeline_code))
+        return
     root = a.root
     if a.remote:
         root = tempfile.mkdtemp(prefix="vngis_verify_")
@@ -306,6 +352,89 @@ def complete_progress(a):
     images = {(k, g, m): ('done', '') for k in ['day', 'night']
               for g in a['GID_3'] for m in range(1, 13)}
     return D.progress(a, {k: records(a, k) for k in ['day', 'night']}, images)
+
+
+class ProgressSummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)/'VNGISDash_2024'
+        self.path = self.root/'_control/progress.csv'
+        self.path.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_legacy_uppercase_commune_progress_does_not_claim_monthly_completion(self):
+        pd.DataFrame({'GID_3': ['VNM.1.2_1', 'VNM.1.10_1'], 'status': ['done', 'done']}).to_csv(self.path, index=False)
+        original = self.path.read_bytes()
+        report = Q.summarize_progress(self.root, '1')
+        self.assertIn('Tổng 2 xã, 2 dòng', report)
+        self.assertIn('bảng tiến độ cũ', report)
+        self.assertIn('Mã thoát pipeline: `1`', report)
+        self.assertNotIn('- day_image:', report)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_new_monthly_progress_reports_all_four_fields_and_no_source(self):
+        frame = complete_progress(admin())
+        frame.loc[0, 'day_image'] = 'no_source'
+        frame.to_csv(self.path, index=False)
+        report = Q.summarize_progress(self.root, '0')
+        self.assertIn('24 xã–tháng', report)
+        for field in D.FIELDS:
+            self.assertIn(f'- {field}:', report)
+        self.assertIn("'no_source': 1", report)
+        self.assertNotIn('Cảnh báo', report)
+
+    def test_uppercase_monthly_identifiers_are_supported_read_only(self):
+        frame = complete_progress(admin()).rename(columns={c: c.upper() for c in D.PREFIX})
+        frame.to_csv(self.path, index=False)
+        self.assertNotIn('Cảnh báo', Q.summarize_progress(self.root))
+
+    def test_missing_empty_malformed_and_conflicting_progress_show_warnings(self):
+        self.assertIn('chưa có progress.csv', Q.summarize_progress(self.root))
+        for text in ['', 'status\ndone\n', 'gid_3,status\n"unfinished',
+                     'gid_3,GID_3\nVNM.1_1,VNM.2_1\n']:
+            with self.subTest(text=text):
+                self.path.write_text(text)
+                original = self.path.read_bytes()
+                self.assertIn('Cảnh báo', Q.summarize_progress(self.root))
+                self.assertEqual(self.path.read_bytes(), original)
+
+    def test_duplicate_or_invalid_month_keys_are_not_reported_as_verified(self):
+        frame = complete_progress(admin())
+        for bad in [pd.concat([frame, frame.iloc[[0]]]), frame.assign(year=2023),
+                    frame.assign(month=13), frame.assign(gid_3=np.nan)]:
+            with self.subTest(rows=len(bad)):
+                bad.to_csv(self.path, index=False)
+                report = Q.summarize_progress(self.root)
+                self.assertIn('bảng chưa được xác minh', report)
+                self.assertNotIn('- day_image:', report)
+
+    def test_missing_month_or_unknown_status_is_visible(self):
+        frame = complete_progress(admin()).iloc[:-1].copy()
+        frame.loc[0, 'day_image'] = 'unexpected'
+        frame.to_csv(self.path, index=False)
+        report = Q.summarize_progress(self.root)
+        self.assertIn('chưa đủ 12 dòng', report)
+        self.assertIn('trạng thái trống hoặc không hợp lệ', report)
+
+    def test_actual_workflow_summary_command_handles_legacy_progress_after_failure(self):
+        # Execute the shell body used by Actions, preventing drift between CLI and YAML.
+        repository = Path(V.__file__).resolve().parent
+        workflow = (repository/'.github/workflows/vngis-2024.yml').read_text()
+        section = workflow.split('      - name: Tóm tắt tiến độ\n', 1)[1].split('\n      - name:', 1)[0]
+        command = '\n'.join(line[10:] for line in section.split('        run: |\n', 1)[1].splitlines())
+        summary = self.root/'summary.md'
+        pd.DataFrame({'GID_3': ['VNM.1.2_1'], 'status': ['done']}).to_csv(self.path, index=False)
+        env = dict(os.environ, VNGIS_LOCAL_ROOT=str(self.root), GITHUB_STEP_SUMMARY=str(summary),
+                   VNGIS_PIPELINE_CODE='1', PATH=str(Path(sys.executable).parent)+os.pathsep+os.environ['PATH'])
+        result = subprocess.run(['bash', '-e', '-c', command], cwd=repository, env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Mã thoát pipeline: `1`', summary.read_text())
+        self.assertIn('bảng tiến độ cũ', summary.read_text())
+        self.assertIn("steps.pipeline.outputs.code != '0'", workflow)
+        self.assertIn('Báo lỗi nếu script thoát bất thường', workflow)
 
 
 class ContractTests(unittest.TestCase):

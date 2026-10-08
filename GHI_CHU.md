@@ -14,4 +14,8 @@ Nền khoa học và cách tải trực tiếp lấy từ `vngis-github-repo-v6.
 
 ## Dọn nhánh theo danh sách ZIP v6
 
-Nhánh chỉ giữ đúng 8 đường dẫn trong ZIP: vngis_2024.py, verify_pilot.py, requirements.txt, .gitignore, HUONG_DAN.md, DOI_CHIEU_NOTEBOOK.md, GHI_CHU.md và .github/workflows/vngis-2024.yml. Các file phụ, thư mục tests, workflow tests riêng, notebook và báo cáo riêng đã được gỡ sau khi gộp tính năng vào hai file Python. Workflow v6 vẫn chạy CI offline trên PR/main và kiểm thử trước xử lý dữ liệu. 39 kiểm thử được giữ, gồm hash AST khoa học từ ZIP. Không xóa dữ liệu Drive hoặc chạy toàn quốc khi dọn repo.
+Nhánh chỉ giữ đúng 8 đường dẫn trong ZIP: vngis_2024.py, verify_pilot.py, requirements.txt, .gitignore, HUONG_DAN.md, DOI_CHIEU_NOTEBOOK.md, GHI_CHU.md và .github/workflows/vngis-2024.yml. Các file phụ, thư mục tests, workflow tests riêng, notebook và báo cáo riêng đã được gỡ sau khi gộp tính năng vào hai file Python. Workflow v6 vẫn chạy CI offline trên PR/main và kiểm thử trước xử lý dữ liệu. Kiểm thử gồm hash AST khoa học từ ZIP. Không xóa dữ liệu Drive hoặc chạy toàn quốc khi dọn repo.
+
+## Sửa lỗi tóm tắt tiến độ
+
+Tóm tắt dùng chung hàm chỉ đọc trong verify_pilot.py, chấp nhận GID_3/gid_3. Bảng v6 cũ theo xã được cảnh báo chưa có schema tháng, không bị coi hoàn tất. File thiếu/trống/sai cột được báo rõ; mã lỗi pipeline vẫn làm workflow thất bại. Thêm 7 kiểm thử hồi quy, gồm chạy đúng lệnh shell của workflow với bảng cũ sau pipeline mã 1. Artifact log và progress giúp chẩn đoán khi Drive không đồng bộ được. Lỗi gốc của pipeline cần log bước Chạy pipeline; không thể kết luận từ riêng KeyError ở bước tóm tắt.

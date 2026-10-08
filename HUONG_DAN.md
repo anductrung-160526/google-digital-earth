@@ -87,6 +87,10 @@ Không có tham số bảo đảm hết 429. Giữ mặc định qua pilot; nế
 - Mỗi xã/giai đoạn tối đa 3 lần thử, lưu trong JSONL. Sau khi đã xử lý nguyên nhân, chọn `retry_failed=true` trong Run workflow để cho phép thử lại các phần còn thiếu. File đã hợp lệ vẫn được bỏ qua.
 - Đừng dùng Cancel chỉ để tăng tốc; runner bị dừng cưỡng bức có thể chưa upload checkpoint cuối. Concurrency dùng chung `vngis-2024`, không tự hủy lượt đang chạy. Lượt workflow cũ đang chạy không tự nhận bản sửa này.
 
+Bước Tóm tắt tiến độ hỗ trợ `GID_3` viết hoa của progress v6 cũ và `gid_3` của bảng mới. Nếu kiểm kê dừng trước khi chuyển schema, Summary cảnh báo bảng cũ/chưa xác minh thay vì lỗi `KeyError`; không suy ra đủ dữ liệu từ trạng thái cũ. File thiếu, trống hoặc sai cấu trúc cũng được báo rõ. Tóm tắt chỉ đọc, không sửa CSV và không thay mã thoát pipeline.
+
+Khi workflow báo mã 1, mở **Chạy pipeline** và tìm `LỖI`, `PREFLIGHT`, `hết số lần thử` hoặc `checkpoint`; lỗi ở bước tóm tắt không giải thích nguyên nhân kiểm kê/xử lý dừng. Workflow lưu log cục bộ và progress trong artifact `vngis-diagnostics-<run_id>-<run_attempt>` (7 ngày), kể cả khi upload Drive cuối lượt thất bại. Có thể tóm tắt cục bộ bằng `python verify_pilot.py --progress-summary --root <thư mục dữ liệu> --pipeline-code 1`.
+
 ## Kiểm thử và giới hạn xác minh
 
 `python verify_pilot.py --self-test` chạy schema, kiểm kê bằng Drive giả có file TIFF thật, chạy tiếp, thứ tự giai đoạn, 429/Retry-After, outbox và kiểm tra AST các hàm khoa học so với v6. `verify_pilot.py --remote gdrive:VNGISDash_2024_PILOT` kiểm tra dữ liệu thật sau pilot; báo lỗi nếu không có xã để xác minh.

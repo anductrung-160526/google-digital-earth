@@ -241,17 +241,22 @@ jobs:
 
       - name: Tóm tắt tiến độ
         if: always()
+        env:
+          VNGIS_PIPELINE_CODE: ${{ steps.pipeline.outputs.code }}
         run: |
-          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import os, pandas as pd
-          p = os.path.expanduser(f"~/vngis_2024/{os.environ['VNGIS_DRIVE_FOLDER']}/_control/progress.csv")
-          if os.path.isfile(p):
-              d = pd.read_csv(p)
-              print(f"### Tiến độ ({os.environ['VNGIS_DRIVE_FOLDER']})\n")
-              print(f"Tổng {d['gid_3'].nunique():,} xã, {len(d):,} xã–tháng\n")
-              for field in ('day_image', 'day_indices', 'night_image', 'night_indices'):
-                  print(f"- {field}: {d[field].value_counts().to_dict()}")
-          PY
+          python verify_pilot.py --progress-summary \
+            --pipeline-code "$VNGIS_PIPELINE_CODE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lưu log chẩn đoán và tiến độ
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vngis-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/vngis_2024/${{ env.VNGIS_DRIVE_FOLDER }}/_control/logs/*.log
+            ~/vngis_2024/${{ env.VNGIS_DRIVE_FOLDER }}/_control/progress.csv
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Nối lượt kế tiếp
         if: steps.pipeline.outputs.code == '3'
@@ -276,5 +281,5 @@ jobs:
           steps.pipeline.outputs.code != '0' &&
           steps.pipeline.outputs.code != '3' && steps.pipeline.outputs.code != '130'
         run: |
-          echo "::error::Script thoát với mã ${{ steps.pipeline.outputs.code }}. Mở bước 'Chạy pipeline', tìm các dòng [preflight] hoặc ERROR."
+          echo "::error::Script thoát với mã ${{ steps.pipeline.outputs.code }}. Mở bước 'Chạy pipeline', tìm LỖI, PREFLIGHT, hết số lần thử hoặc checkpoint; log cục bộ có trong artifact vngis-diagnostics."
           exit 1
