@@ -108,10 +108,28 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(len(frame), 24)
 
     def test_boundary_count_and_duplicate_gid_fail_explicitly(self):
-        with self.assertRaisesRegex(ValueError, '11,136'):
+        with self.assertRaisesRegex(ValueError, '11,163'):
             D.administrative_table(self.a)
         with self.assertRaisesRegex(ValueError, 'mã trùng'):
             D.administrative_table(pd.concat([self.a, self.a]), expected=None)
+
+    def test_full_gadm_scope_is_accepted_and_old_count_is_rejected(self):
+        self.assertEqual(D.EXPECTED_COMMUNES, 11163)
+        full = admin(tuple(f'VNM.1.{i}_1' for i in range(1, 11164)))
+        self.assertEqual(len(D.administrative_table(full)), 11163)
+        with self.assertRaisesRegex(ValueError, '11,136.*11,163'):
+            D.administrative_table(full.iloc[:11136])
+
+    def test_full_gadm_scope_still_rejects_duplicates_and_missing_names(self):
+        full = admin(tuple(f'VNM.1.{i}_1' for i in range(1, 11164)))
+        duplicate = full.copy()
+        duplicate.loc[1, 'GID_3'] = duplicate.loc[0, 'GID_3']
+        with self.assertRaisesRegex(ValueError, 'mã trùng'):
+            D.administrative_table(duplicate)
+        blank = full.copy()
+        blank.loc[1, 'NAME_3'] = ''
+        with self.assertRaisesRegex(ValueError, 'thông tin hành chính trống'):
+            D.administrative_table(blank)
 
     def test_night_columns_and_first_month_growth_nan_is_valid(self):
         frame = D.normalize(records(self.a, 'night'), self.a, 'night')
@@ -247,7 +265,7 @@ class ImageAndRunnerTests(unittest.TestCase):
         table['night_image'] = 'pending'
         collection = Mock()
         collection.size.return_value.getInfo.return_value = 0
-        with patch.object(C, 'require_day_complete', return_value=table), patch.object(C, '_viirs_col', return_value=collection), patch.object(C.ee.Geometry, 'Rectangle'), patch.object(C.ee.batch.Export.image, 'toDrive') as export:
+        with patch.object(C, 'require_day_complete', return_value=table), patch.object(C, '_viirs_col', return_value=collection), patch.object(C.ee.Geometry, 'Rectangle'), patch.object(C.ee.batch.Export.image, 'toDrive') as export, patch('builtins.print'):
             C.submit_night_images(months=[1])
         export.assert_not_called()
 
@@ -278,7 +296,8 @@ class ImageAndRunnerTests(unittest.TestCase):
         table = complete_progress(admin())
         table.loc[0, 'day_indices'] = 'failed'
         with patch('sys.argv', ['process_exports.py', 'night']), patch.object(P, 'setup'), patch.object(P, 'inventory', side_effect=lambda: setattr(P, 'PROGRESS', table) or table), patch.object(P, 'night_csv') as csv, patch.object(P, 'run_images') as images, patch.object(V, 'MAX_RUNTIME_SEC', 0):
-            self.assertEqual(P.main(), 1)
+            with self.assertLogs(P.log, level='ERROR'):
+                self.assertEqual(P.main(), 1)
             csv.assert_not_called()
             images.assert_not_called()
 

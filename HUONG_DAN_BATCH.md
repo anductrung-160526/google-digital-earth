@@ -6,8 +6,10 @@ Pipeline dùng Earth Engine batch export, rồi cắt ảnh theo xã trên GitHu
 
 - Dùng các file mới cùng phiên bản: `vngis_2024.py`, `batch_config.py`, `data_contract.py`, `colab_export.py`, `process_exports.py`, `verify_pilot.py` và notebook.
 - GitHub Actions cần secrets `RCLONE_CONF` (remote `gdrive`) và `EE_SERVICE_ACCOUNT_JSON` có quyền Earth Engine trên project `vngis-ee-2`. Không đưa khóa vào repo hoặc chat.
-- Bảng địa giới phải có đúng **11.136 mã xã duy nhất**, đủ GID/NAME cấp 1, 2, 3 và TYPE_3. Asset `projects/vngis-ee-2/assets/communes_l3` phải chứa đúng tập mã đó; Colab đối chiếu cả tập mã, không chỉ số lượng.
-- Mặc định bảng lấy từ GADM 4.1. Nếu không có đúng 11.136 xã, pipeline dừng và báo số thực tế; không tự tạo/bỏ xã. Có thể cung cấp CSV địa giới chuẩn bằng `VNGIS_ADMIN_FILE` (đường dẫn file; tên cột hành chính viết hoa hoặc viết thường). Bảng và asset phải cùng bộ địa giới bạn chọn cho năm 2024. Không đổi số kỳ vọng chỉ để cho chạy qua.
+- Phạm vi đã chọn là toàn bộ **11.163 đơn vị cấp 3 GADM 4.1 Việt Nam**, với GID_3 duy nhất, đủ GID/NAME cấp 1, 2, 3 và TYPE_3. Asset `projects/vngis-ee-2/assets/communes_l3` phải chứa đúng tập mã đó; Colab đối chiếu cả tập mã, không chỉ số lượng.
+- Bảng GADM thật đã được kiểm tra có 11.163 mã duy nhất, 63 tỉnh, không thiếu thông tin hành chính. TYPE_3 gồm 8.972 xã, 1.586 phường, 601 thị trấn, 2 trung tâm huấn luyện và 2 đảo; giữ toàn bộ theo lựa chọn phạm vi, không tự loại các loại đơn vị khác xã.
+- Lỗi cũ `Phạm vi địa giới có 11,163 xã; yêu cầu 11,136` là do số kỳ vọng không khớp GADM. Số kỳ vọng đã đổi sang 11.163 theo lựa chọn rõ ràng của người dùng. Nếu còn lỗi `Asset không khớp địa giới`, cần đối chiếu GID_3 của asset với GADM, không chỉ sửa tổng số hoặc tự bỏ 27 đơn vị.
+- Có thể cung cấp CSV địa giới cùng phạm vi bằng `VNGIS_ADMIN_FILE` (đường dẫn file; tên cột hành chính viết hoa hoặc viết thường). Dữ liệu ảnh/chỉ số vẫn thuộc 12 tháng năm 2024; lựa chọn GADM 4.1 không tự xác nhận đây là bộ địa giới chính thức tại mọi thời điểm trong năm 2024.
 - Workflow cũ `vngis-2024.yml` hiện gọi cùng pipeline batch. CLI `python vngis_2024.py day` cũng chuyển sang batch; luồng cũ chạy ngày/đêm cùng lúc đã ngừng sử dụng.
 
 ## 1. Kiểm kê dữ liệu cũ
