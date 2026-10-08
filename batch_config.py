@@ -3,7 +3,7 @@
 
 Luồng: Colab (tài khoản của bạn) gửi tác vụ Export lên Earth Engine -> kết quả ghi vào thư mục
 EXPORT_FOLDER trên Drive -> GitHub Actions (process_exports.py) cắt ảnh theo xã, gộp CSV, ghi vào
-VNGISDash_2024 theo đúng cấu trúc cũ rồi xóa file export tạm.
+VNGISDash_2024. Hoàn tất phần ngày trước phần đêm; giữ export dùng chung để chạy tiếp.
 """
 
 PROJECT_ID = "vngis-ee-2"

@@ -13,13 +13,12 @@ import argparse, glob, json, os, subprocess, sys, tempfile
 
 import numpy as np
 import pandas as pd
+import data_contract as D
 
 M_PER_DEG = 111319.49
 DAY_BANDS_ALL = ["BLUE", "GREEN", "RED", "NIR", "SWIR1", "SWIR2", "NDVI", "NDBI", "MNDWI", "BSI"]
 T1_FEATS = [f"{b}_{s}" for b in DAY_BANDS_ALL for s in ("mean", "stdDev")]
-T3_COLS = ["GID_1", "NAME_1", "GID_3", "NAME_3", "YEAR", "MONTH", "TIME", "COMMUNE_AREA_HA", "TNL", "MEAN_RAD",
-           "STD_RAD", "MIN_RAD", "MAX_RAD", "SPATIAL_CV", "LIT_PIXELS", "LIT_AREA_HA", "ELECTRIFICATION_RATIO_PCT",
-           "LIT_POP_PROXY", "CLOUD_FREE_OBS", "TNL_MA3", "TNL_MOM_GROWTH_PCT"]
+T3_COLS = D.COLUMNS["night"]
 
 
 def load_status(root):
@@ -72,67 +71,51 @@ def worst(*levels):
 
 
 def verify_commune(root, gid, st, day_csv, night_csv):
-    safe = gid.replace(".", "_")
-    st = st or {}
-    res = [("Trạng thái", "PASS" if st.get("status") == "done" else "FAIL", st.get("status", "không có bản ghi"))]
-    day_bands = int(st.get("day_bands", 10))
-
-    for kind, sub, key, bands, scale, dtype in (("Ảnh ngày", "Day", "t2", day_bands, 20, None),
-                                                ("Ảnh đêm", "Night", "t3img", 2, 500, "float64")):
-        files = sorted(glob.glob(os.path.join(root, sub, "*", f"{gid}_*", f"{safe}_{sub.lower()}_2024??.tif")))
-        none_m = sorted(k for k, v in (st.get(key) or {}).items() if v == "none")
-        need = 12 - len(none_m)
-        lv, notes = ("PASS" if len(files) == need else "FAIL"), [f"{len(files)}/{need} file"]
-        if none_m:
-            notes.append(f"tháng không có ảnh: {','.join(none_m)}")
-        empties, sizes = [], []
-        for p in files:
-            sizes.append(os.path.getsize(p) / 1024)
-            r, n = check_tif(p, bands, scale, dtype)
-            if r == "FAIL":
-                lv = "FAIL"
-                notes.append(f"{os.path.basename(p)}: {n}")
-            elif r == "WARN":
-                empties.append(p[-10:-4])
-        if empties:
-            lv = worst(lv, "WARN" if len(empties) < len(files) else "FAIL")
-            notes.append(f"tháng toàn NoData: {','.join(empties)}")
-        if sizes:
-            notes.append(f"dung lượng {min(sizes):.0f} đến {max(sizes):.0f} KB/ảnh, TB {np.mean(sizes):.0f} KB")
-        res.append((f"{kind} ({bands} kênh, {scale} m)", lv, "; ".join(notes)))
-
-    d = day_csv[day_csv["GID_3"] == gid] if day_csv is not None else pd.DataFrame()
-    if d.empty:
-        res.append(("CSV/day_indices.csv", "FAIL", "không có dòng của xã này"))
-    else:
-        miss = [c for c in T1_FEATS if c not in d.columns]
-        allnan = [c for c in T1_FEATS if c in d.columns and d[c].isna().all()]
-        lv = "FAIL" if (miss or allnan or len(d) > 12 or d["MONTH"].duplicated().any()) else "PASS"
-        if lv == "PASS" and d[T1_FEATS].isna().any(axis=1).any():
-            lv = "WARN"
-        res.append(("CSV/day_indices.csv (20 cột chỉ số)", lv, f"{len(d)} tháng"
-                    + (f"; thiếu cột {miss}" if miss else "") + (f"; cột rỗng {allnan}" if allnan else "")))
-
-    n = night_csv[night_csv["GID_3"] == gid] if night_csv is not None else pd.DataFrame()
-    need3 = 12 - sum(v == "none" for v in (st.get("t3img") or {}).values())
-    if n.empty:
-        res.append(("CSV/night_indices.csv", "FAIL", "không có dòng của xã này"))
-    else:
-        ok_cols = list(night_csv.columns) == T3_COLS
-        res.append(("CSV/night_indices.csv (21 cột như notebook)", "PASS" if ok_cols and len(n) == need3 else "FAIL",
-                    f"{len(n)} dòng" + ("" if ok_cols else f"; cột lệch: {list(night_csv.columns)}")))
-    res.append(("Thời gian xử lý", "PASS", f"{st.get('seconds', '?')} giây ở lần xử lý cuối"))
+    """Verify actual per-month outputs; old done status alone is never evidence."""
+    res = []
+    sources = D.read_sources(os.path.join(root, '_control', 'source_counts.csv'))
+    for kind, original in [('day', day_csv), ('night', night_csv)]:
+        frame = D.aliases(original) if original is not None else pd.DataFrame()
+        mine = frame[frame['gid_3'].eq(gid)] if 'gid_3' in frame else pd.DataFrame()
+        notes = []
+        if list(frame.columns) != D.COLUMNS[kind]:
+            notes.append('Sai schema/thứ tự cột')
+        if len(mine) != 12 or 'month' not in mine or set(mine.get('month', [])) != set(D.MONTHS):
+            notes.append('Phải có đúng 12 tháng')
+        if not mine.empty and ('year' not in mine or not mine['year'].eq(2024).all() or mine.duplicated(D.KEY).any()):
+            notes.append('Năm sai hoặc trùng khóa')
+        for _, row in mine.iterrows():
+            state, error = D.metric_state(row, kind, sources.get((gid, int(row['month']), kind + '_indices')))
+            if state not in D.TERMINAL:
+                notes.append(f"tháng {row['month']}: {state} {error}")
+        res.append((f'CSV/{kind}_indices.csv', 'FAIL' if notes else 'PASS', '; '.join(notes) or '12 tháng, đủ cột'))
+        invalid = []
+        for m in D.MONTHS:
+            safe = gid.replace('.', '_')
+            files = glob.glob(os.path.join(root, kind.title(), '*', f'{gid}_*', f'{safe}_{kind}_2024{m:02d}.tif'))
+            if not files and sources.get((gid, m, kind + '_image')) == 0:
+                continue
+            if len(files) != 1:
+                invalid.append(f'tháng {m}: {len(files)} file')
+            else:
+                state, error = D.validate_image(files[0], kind)
+                if state != 'done':
+                    invalid.append(f'tháng {m}: {error}')
+        res.append((f'Ảnh {kind}', 'FAIL' if invalid else 'PASS', '; '.join(invalid) or 'đọc được, đúng kênh/CRS/độ phân giải'))
     return res
 
 
 def _cmp_csv(a, b, tol):
-    a, b = a.sort_values("MONTH").reset_index(drop=True), b.sort_values("MONTH").reset_index(drop=True)
+    a, b = D.aliases(a), D.aliases(b)
+    a, b = a.sort_values('month').reset_index(drop=True), b.sort_values('month').reset_index(drop=True)
     if len(a) != len(b):
         return "FAIL", f"số dòng {len(a)} vs {len(b)}"
     cols = [c for c in a.columns if c in b.columns and pd.api.types.is_numeric_dtype(a[c])
             and pd.api.types.is_numeric_dtype(b[c])]
     diffs = {c: float(np.nanmax(np.abs(a[c].astype(float) - b[c].astype(float)))) if a[c].notna().any() else 0.0
              for c in cols}
+    if not cols:
+        return 'FAIL', 'Không có cột chỉ số số học để đối chiếu'
     nan_mismatch = [c for c in cols if not (a[c].isna() == b[c].isna()).all()]
     bad = {c: x for c, x in diffs.items() if x > tol}
     if bad or nan_mismatch:
@@ -172,7 +155,8 @@ def compare_notebook(root, nb_dir, gid, day_csv, night_csv):
                                 ("Đối chiếu chỉ số đêm", night_csv,
                                  f"*_{safe}_202401-202412_Economic_Indices.csv", 1e-6)):
         ref = glob.glob(os.path.join(nb_dir, pat))
-        mine = df[df["GID_3"] == gid] if df is not None else pd.DataFrame()
+        frame = D.aliases(df) if df is not None else pd.DataFrame()
+        mine = frame[frame['gid_3'] == gid] if 'gid_3' in frame else pd.DataFrame()
         if not ref or mine.empty:
             out.append((label, "WARN", "thiếu file để so"))
             continue
@@ -223,10 +207,16 @@ def main():
 
     def _csv(name):
         p = os.path.join(root, "CSV", name)
-        return pd.read_csv(p, dtype={"GID_1": str, "GID_3": str}) if os.path.isfile(p) else None
+        return pd.read_csv(p, dtype={'gid_3': str, 'GID_3': str}) if os.path.isfile(p) else None
     day_csv, night_csv = _csv("day_indices.csv"), _csv("night_indices.csv")
     st = load_status(root)
-    gids = [g.strip() for g in a.gids.split(",") if g.strip()] or sorted(st)
+    known = set(st)
+    for frame in [day_csv, night_csv]:
+        if frame is not None:
+            known.update(D.aliases(frame).get('gid_3', []))
+    gids = [g.strip() for g in a.gids.split(',') if g.strip()] or sorted(known, key=D.natural_key)
+    if not gids:
+        sys.exit('Không có xã nào để kiểm tra; không thể xác nhận thành công.')
     lines = ["## Kết quả kiểm tra thí điểm VNGISDash 2024", ""]
     any_fail = False
     for gid in gids:
@@ -239,7 +229,7 @@ def main():
         lines += [f"| {m} | {r} | {_short(n)} |" for m, r, n in rows]
         lines.append("")
     lines.append("**Kết luận: " + ("CÓ MỤC FAIL, chưa chạy toàn quốc.**" if any_fail else
-                                  "ĐẠT. Có thể chạy toàn quốc (xem các dòng WARN nếu có).**"))
+                                  "ĐẠT cho các xã được kiểm tra.**"))
     text = "\n".join(lines)
     print(text)
     report = a.report or os.path.join(root, "_control", "verify_report.md")

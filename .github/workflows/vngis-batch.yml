@@ -4,18 +4,31 @@ name: VNGISDash 2024 batch (cắt ảnh export theo xã)
 # step:
 #   inventory  kiểm kê Drive -> _control/progress.csv
 #   day        CSV ngày + cắt ảnh ngày + kiểm kê   (chạy trước)
-#   night      CSV đêm + cắt ảnh đêm + kiểm kê     (chạy sau khi phần ngày xong)
+#   night      chỉ được chạy khi kiểm kê toàn bộ phần ngày hợp lệ
 #   day-csv | day-img | night-csv | night-img      chạy riêng từng phần
 # Mỗi lượt tối đa ~5 giờ 15 phút rồi tự nối lượt cho tới khi xong.
 # Dừng chuỗi: tạo file STOP_BATCH ở thư mục gốc repo.
 
 on:
+  workflow_call:
+    inputs:
+      step:
+        type: string
+        default: day
+      compare:
+        type: string
+        default: "0"
+    secrets:
+      RCLONE_CONF:
+        required: true
+      EE_SERVICE_ACCOUNT_JSON:
+        required: true
   workflow_dispatch:
     inputs:
       step:
         description: "Phần cần chạy"
         type: choice
-        options: [day, night, inventory, day-csv, day-img, night-csv, night-img]
+        options: [inventory, day, night, day-csv, day-img, night-csv, night-img]
         default: day
       compare:
         description: "Số xã đã có ảnh cũ dùng để so sánh từng pixel (0 = không so sánh)"
@@ -75,16 +88,17 @@ jobs:
           path: |
             ~/venv
             ~/bin/rclone
-          key: deps-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-rclone1
+          key: deps-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-rclone2
 
       - name: Cài thư viện và rclone
         if: steps.gate.outputs.stop != 'true' && steps.deps.outputs.cache-hit != 'true'
         run: |
           python -m venv ~/venv
           ~/venv/bin/pip install -q -r requirements.txt
-          mkdir -p ~/bin && cd /tmp
-          curl -fsSL -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip -q rclone.zip && cp rclone-*-linux-amd64/rclone ~/bin/ && chmod +x ~/bin/rclone
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          mkdir -p ~/bin
+          cp /usr/bin/rclone ~/bin/rclone
 
       - name: Đưa venv và rclone vào PATH
         if: steps.gate.outputs.stop != 'true'
@@ -105,11 +119,16 @@ jobs:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
           EE_KEY_DATA: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
         run: |
+          [ -n "$EE_KEY_DATA" ] || { echo "::error::Thiếu secret EE_SERVICE_ACCOUNT_JSON"; exit 1; }
           [ -n "$RCLONE_CONF_DATA" ] || { echo "::error::Thiếu secret RCLONE_CONF"; exit 1; }
           mkdir -p "$HOME/.config/rclone"
           printf '%s' "$RCLONE_CONF_DATA" > "$HOME/.config/rclone/rclone.conf"
           printf '%s' "$EE_KEY_DATA" > "$RUNNER_TEMP/ee-key.json"
           chmod 600 "$HOME/.config/rclone/rclone.conf" "$RUNNER_TEMP/ee-key.json"
+
+      - name: Kiểm thử hợp đồng dữ liệu
+        if: steps.gate.outputs.stop != 'true'
+        run: python -m unittest discover -s tests -v
 
       - name: Chạy
         if: steps.gate.outputs.stop != 'true'
@@ -123,7 +142,9 @@ jobs:
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "Mã thoát $code"
-          exit 0
+          # Exit 3 is resumable; all other nonzero outcomes fail this job.
+          if [ "$code" -eq 3 ]; then exit 0; fi
+          exit "$code"
 
       - name: Nối lượt kế tiếp
         if: steps.main.outputs.code == '3'

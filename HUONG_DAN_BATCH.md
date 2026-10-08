@@ -1,60 +1,104 @@
-# Lấy dữ liệu theo lô (batch export)
+# VNGIS 2024: ngày trước, đêm sau, chạy tiếp từ Drive
 
-Earth Engine tự tính trên máy chủ và ghi vào thư mục tạm `VNGIS_EXPORT_2024` trên Drive. GitHub Actions cắt ảnh theo xã, gộp CSV, ghi vào `VNGISDash_2024` đúng cấu trúc cũ rồi xóa file tạm. Cách này không bị lỗi 429 và tốn rất ít quota tương tác.
+Pipeline dùng Earth Engine batch export, rồi cắt ảnh theo xã trên GitHub Actions. Thư mục đích là **VNGISDash_2024**; export dùng chung nằm trong **VNGIS_EXPORT_2024** và được giữ lại để sửa phần thiếu. Không xóa thư mục đích hay export khi nâng cấp.
 
-## Bước 0. Chuẩn bị
+## Chuẩn bị và phạm vi địa giới
 
-1. Tắt pipeline cũ: tab **Actions**, chọn **VNGISDash 2024 (chạy nối lượt)**, bấm **…** > **Disable workflow**. Nếu còn lượt đang chạy thì **Cancel**.
-2. Nếu trên Drive có file `VNGISDash_2024/_control/STOP`, xóa nó đi (file này cũng dừng workflow mới).
-3. Đưa các file mới lên repo: `batch_config.py`, `colab_export.py`, `process_exports.py`, `.github/workflows/vngis-batch.yml`, `VNGIS_batch_colab.ipynb`, `HUONG_DAN_BATCH.md`.
-4. Secret `EE_SERVICE_ACCOUNT_JSON` nên là khóa của service account thuộc `vngis-ee-2`. Workflow dùng nó để xem tác vụ export đã xong chưa.
+- Dùng các file mới cùng phiên bản: `vngis_2024.py`, `batch_config.py`, `data_contract.py`, `colab_export.py`, `process_exports.py`, `verify_pilot.py` và notebook.
+- GitHub Actions cần secrets `RCLONE_CONF` (remote `gdrive`) và `EE_SERVICE_ACCOUNT_JSON` có quyền Earth Engine trên project `vngis-ee-2`. Không đưa khóa vào repo hoặc chat.
+- Bảng địa giới phải có đúng **11.136 mã xã duy nhất**, đủ GID/NAME cấp 1, 2, 3 và TYPE_3. Asset `projects/vngis-ee-2/assets/communes_l3` phải chứa đúng tập mã đó; Colab đối chiếu cả tập mã, không chỉ số lượng.
+- Mặc định bảng lấy từ GADM 4.1. Nếu không có đúng 11.136 xã, pipeline dừng và báo số thực tế; không tự tạo/bỏ xã. Có thể cung cấp CSV địa giới chuẩn bằng `VNGIS_ADMIN_FILE` (đường dẫn file; tên cột hành chính viết hoa hoặc viết thường). Bảng và asset phải cùng bộ địa giới bạn chọn cho năm 2024. Không đổi số kỳ vọng chỉ để cho chạy qua.
+- Workflow cũ `vngis-2024.yml` hiện gọi cùng pipeline batch. CLI `python vngis_2024.py day` cũng chuyển sang batch; luồng cũ chạy ngày/đêm cùng lúc đã ngừng sử dụng.
 
-## Bước 1. Kiểm kê ban đầu
+## 1. Kiểm kê dữ liệu cũ
 
-**Actions** > **VNGISDash 2024 batch** > **Run workflow**, chọn `step = inventory`. Kết quả nằm trong `VNGISDash_2024/_control/progress.csv` và tab Summary của lượt chạy.
+Chạy workflow **VNGISDash 2024 batch**, chọn `step=inventory`. Nó:
 
-## Bước 2. Phần ngày (ưu tiên)
+1. Đọc dữ liệu thật trong `Day`, `Night`, `CSV` và tiến độ trước đó.
+2. Đọc mọi block của ảnh chưa được xác minh để phát hiện file hỏng; kiểm tra số kênh, CRS, kích thước pixel và kiểu dữ liệu. Lần đầu có thể tốn nhiều I/O. Các lượt sau tái sử dụng kết quả đã kiểm tra chỉ khi đường dẫn, kích thước, thời gian sửa, hash do Drive cung cấp và phiên bản kiểm tra không đổi.
+3. Chuyển CSV cũ sang schema mới, ghép thông tin hành chính bằng GID. Sao lưu bản cũ vào `_control/backups/<thời điểm>/CSV/...` trước khi thay thế. Upload qua file tạm rồi chuyển thành tên chính thức; lỗi sao lưu/upload làm bước thất bại.
+4. Ghi `_control/progress.csv`: một dòng mỗi xã–tháng. `done` cũ hoặc `batch_done.txt` không thể thay thế kiểm tra file thật.
 
-**Trên Colab** (mở `VNGIS_batch_colab.ipynb`, chạy lần lượt):
-1. Tải lên 3 file: `vngis_2024.py`, `batch_config.py`, `colab_export.py`.
-2. `cx.init()`: đăng nhập bằng email chủ project `vngis-ee-2`, cho phép mount Drive.
-3. `cx.submit_communes()` và `cx.quick_check()`: `quick_check` in ra số liệu mẫu, nếu báo lỗi thì dừng lại và gửi lỗi.
-4. `cx.compute_day_plan()`: chọn cửa sổ thời gian cho từng xã và từng tháng, ghi `plan_day.json` vào Drive.
-5. `cx.submit_day_csv()` và `cx.submit_day_images()`.
-6. `cx.status()` để xem tiến độ. Có thể đóng Colab, tác vụ vẫn chạy trên Earth Engine.
+Dữ liệu hợp lệ được giữ nguyên. CSV có chỉ số mâu thuẫn ở cùng khóa, GID ngoài phạm vi hoặc năm/tháng sai sẽ được báo lỗi để xử lý rõ ràng, không âm thầm chọn/xóa bản ghi.
 
-**Trên GitHub:** Run workflow với `step = day`, `compare = 20`. Workflow tự chờ tác vụ export, cắt ảnh khi xong, và tự nối lượt.
+## 2. Giai đoạn ngày
 
-**Kiểm tra lượt đầu:** mở Summary hoặc file `_control/compare_day_img_202401_w0.csv`. File này so 20 xã đã có ảnh cũ với ảnh cắt mới.
-- `KHỚP`: tiếp tục.
-- `KHÁC LƯỚI` hoặc `LỆCH GIÁ TRỊ`: tạo file `STOP_BATCH` ở gốc repo để dừng, rồi gửi file compare.
+Mở `VNGIS_batch_colab.ipynb`, tải lên **4 file** `vngis_2024.py`, `batch_config.py`, `colab_export.py`, `data_contract.py`. Chạy:
 
-## Bước 3. Đối chiếu sang phần đêm
+```python
+import colab_export as cx
+cx.init()                 # xác thực, mount Drive, kiểm tra tập mã xã
+cx.inventory()            # kiểm kê dữ liệu đích trước khi gửi export
+cx.submit_communes()      # ranh giới để cắt ảnh; tái sử dụng export đã có
+cx.quick_check()          # kiểm tra công thức NGÀY trên vài xã
+cx.compute_day_plan()     # giữ cửa sổ tháng / ±15 / ±30 ngày
+cx.submit_day_csv()
+cx.submit_day_images()
+cx.status()
+```
 
-Khi phần ngày xong (Summary báo đủ nhóm, `progress.csv` cột `day_status` gần hết `done`):
-1. Colab: `cx.submit_night_csv()` và `cx.submit_night_images()`.
-2. GitHub: Run workflow với `step = night`. Xã nào đã có ảnh đêm sẽ được bỏ qua, chỉ lấy phần còn thiếu.
+Chỉ gửi tác vụ cho tỉnh/nhóm có phần thiếu. Một export có thể dùng chung cho nhiều xã: vẫn dùng phạm vi tỉnh/nhóm gốc để giữ nguyên công thức và tái sử dụng kết quả. Tác vụ đang READY/RUNNING không được gửi trùng kể cả `force=True`. Tác vụ COMPLETED còn file export được tái sử dụng; nếu file đã mất thì cho phép gửi lại.
 
-## Bước 4. Kiểm kê cuối
+Trên GitHub chạy `step=day`, có thể chọn `compare=20` để đối chiếu ảnh mới với ảnh cũ. Workflow gộp chỉ số ngày, cắt các ảnh ngày còn thiếu/hỏng, rồi kiểm kê lại. Chỉ khi **mọi xã–tháng** có cả `day_image` và `day_indices` bằng `done` hoặc `no_source` mới hoàn tất giai đoạn ngày. Không tự gửi hoặc chạy phần đêm.
 
-Run workflow với `step = inventory`. Xem các cột `day_tif_missing` và `night_tif_missing` trong `progress.csv`.
+## 3. Giai đoạn đêm
 
-## Đầu ra
+Sau khi phần ngày đạt, chạy trên Colab:
 
-Giữ nguyên cấu trúc cũ:
-- `Day/<GID_1>_<tỉnh>/<GID_3>_<xã>/<GID_3>_day_2024MM.tif`: float, 10 kênh, 20 m, EPSG:4326.
-- `Night/.../<GID_3>_night_2024MM.tif`: 2 kênh `avg_rad`, `cf_cvg`, 500 m.
-- `CSV/day_indices.csv`, `CSV/night_indices.csv`: gộp toàn quốc, cùng cột như trước.
-- `_control/progress.csv`: tiến độ từng xã. `_control/batch_done.txt`: các nhóm ảnh đã cắt xong.
+```python
+cx.require_day_complete() # kiểm tra file thật; không chỉ đọc cờ done
+cx.submit_night_csv()
+cx.submit_night_images()
+```
 
-## Khác biệt so với tải từng xã
+Chạy GitHub `step=night`. Cả Colab, CLI và GitHub đều chặn phần đêm nếu bất kỳ xã–tháng ngày còn pending/running/failed. Có thể chạy riêng `day-csv`, `day-img`, `night-csv`, `night-img`; các bước đêm vẫn phải qua cổng kiểm tra ngày.
 
-- **Ảnh ngày:** median từng pixel chỉ dùng các cảnh phủ pixel đó, nên giá trị bên trong xã giống hệt. Mỗi xã vẫn dùng đúng cửa sổ thời gian của nó (tháng, ±15 hoặc ±30 ngày). Pixel ngay trên ranh giới xã có thể khác vài điểm do cách xác định "pixel thuộc xã". Bước `compare` dùng để đo đúng chênh lệch này.
-- **CSV ngày:** tính theo tỉnh, đúng phạm vi `export_province_s2_local` của notebook (lọc mây và nhánh "không có cảnh đạt thì dùng toàn bộ" xét trên cả tỉnh). Pipeline tải từng xã trước đây xét trên từng xã, nên một số tháng mây nhiều có thể khác nhẹ. Bản batch khớp notebook hơn.
-- **CSV đêm:** mỗi xã vẫn `clip` và `reduceRegion` như notebook. Phần tính CV, MA3, tăng trưởng chép nguyên văn.
+Nếu đủ ảnh nhưng thiếu chỉ số, chỉ export/bổ sung chỉ số bằng các phép tính hiện có trên Earth Engine. Nếu đủ chỉ số nhưng thiếu ảnh, chỉ cắt/bổ sung ảnh. Không suy chỉ số CSV từ ảnh GeoTIFF ở độ phân giải khác với phép giảm mẫu khoa học.
 
-## Dừng và xử lý lỗi
+## Schema và tháng không có nguồn
 
-- Dừng workflow: tạo file `STOP_BATCH` ở gốc repo.
-- Tác vụ export lỗi: trong Colab chạy `cx.status()` để xem lỗi, sau đó gửi lại, ví dụ `cx.submit_day_images(months=[3], force=True)`.
-- Lỗi "vị trí thật khác tên file": thêm biến `VNGIS_TILE_ORDER: colrow` vào phần `env` của workflow rồi chạy lại.
+Hai CSV bắt đầu bằng:
+
+```text
+gid_3,name_3,type_3,gid_2,name_2,gid_1,name_1,year,month
+```
+
+- Ngày: tiếp theo là đủ 20 cột `mean`, `stdDev` của `BLUE,GREEN,RED,NIR,SWIR1,SWIR2,NDVI,NDBI,MNDWI,BSI`, theo thứ tự từng kênh rồi mean/stdDev.
+- Đêm: tiếp theo là `TIME,COMMUNE_AREA_HA,TNL,MEAN_RAD,STD_RAD,MIN_RAD,MAX_RAD,SPATIAL_CV,LIT_PIXELS,LIT_AREA_HA,ELECTRIFICATION_RATIO_PCT,LIT_POP_PROXY,CLOUD_FREE_OBS,TNL_MA3,TNL_MOM_GROWTH_PCT`.
+- Mỗi xã có đúng 12 dòng của 2024. Khóa duy nhất `(gid_3,year,month)`. Sắp xếp GID tự nhiên, tên xã, năm, tháng; tên xã lấy nguyên từ địa giới chuẩn.
+- Dòng chưa xử lý được tạo với chỉ số trống và trạng thái pending/failed. Chỉ ghi `no_source` khi có số cảnh bằng 0 do Earth Engine trả về, không suy từ file thiếu hoặc dòng rỗng. Tháng không có nguồn có toàn bộ chỉ số trống, không thay bằng 0.
+- `_control/source_counts.csv` lưu bằng chứng số cảnh riêng cho từng thành phần. Ảnh ngày có cửa sổ thích ứng, CSV ngày dùng phạm vi/tháng của công thức gốc, nên bằng chứng nguồn của chúng được lưu riêng.
+- `TNL_MOM_GROWTH_PCT` tháng đầu có thể NaN, hoặc vô hạn khi TNL tháng trước bằng 0; đó là kết quả công thức cũ, không bị đổi thành 0.
+- Export CSV ngày cũ không có `SOURCE_COUNT` vẫn giữ được các chỉ số hợp lệ. Nếu còn dòng rỗng không có bằng chứng nguồn, cần tạo lại export tỉnh đó bằng `cx.submit_day_csv(only=["GID_tỉnh"], force=True)` sau khi kiểm tra không có tác vụ đang chạy.
+
+## Tiến độ, chạy tiếp và kiểm tra
+
+`progress.csv` có cột hành chính + year/month, bốn trạng thái `day_image`, `day_indices`, `night_image`, `night_indices`, mỗi trạng thái có cột `_error`. Giá trị: `pending`, `running`, `done`, `no_source`, `failed`. Lượt bị ngắt còn running sẽ chuyển thành failed để chạy lại; file hợp lệ đã hoàn tất vẫn được bỏ qua.
+
+Các thư mục đầu ra giữ nguyên:
+
+```text
+VNGISDash_2024/
+  Day/<tỉnh>/<xã>/...
+  Night/<tỉnh>/<xã>/...
+  CSV/day_indices.csv
+  CSV/night_indices.csv
+  _control/progress.csv
+  _control/source_counts.csv
+  _control/validated_images.json
+  _control/backups/...
+  _control/logs/...
+```
+
+Dừng bằng file `STOP_BATCH` trong repo hoặc `_control/STOP` trên Drive. Chạy lại cùng step để tiếp tục. Mã thoát 0: phần được yêu cầu hoàn tất; 1: lỗi cần xử lý; 3: hết giờ/chờ export, workflow nối lượt. Upload hoặc quyền đọc lỗi không bị coi là file chưa tồn tại.
+
+Mặc định cắt ảnh với 2 worker để hạn chế RAM (`VNGIS_CUT_WORKERS`). `VNGIS_BATCH_WORK` đổi thư mục làm việc cục bộ. Môi trường cloud có thể đặt các đường dẫn dưới `/workspace` thay cho home. Không hứa thời gian hoàn tất toàn quốc khi chưa đo quota Earth Engine và I/O thực tế.
+
+Kiểm thử độc lập:
+
+```bash
+python -m unittest discover -s tests -v
+python verify_pilot.py --root /duong/dan/VNGISDash_2024 --gids VNM.x.y.z_1
+```
+
+Bộ kiểm tra đầu ra yêu cầu schema mới, đúng 12 tháng và ảnh hợp lệ hoặc bằng chứng no_source; chạy không có xã nào sẽ thất bại. Kiểm thử mẫu không xác nhận quyền Google, số xã của asset thật hay dữ liệu thực trên Drive.
