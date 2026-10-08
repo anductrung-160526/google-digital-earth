@@ -1,6 +1,6 @@
 # VNGISDash 2024 v6: ngày trước, đêm sau, chạy tiếp từ Drive
 
-Bản này lấy `vngis-github-repo-v6.zip` làm nền, dùng `getDownloadURL` tải trực tiếp theo xã. Luồng batch export/Colab của các phiên bản sau đã được gỡ khỏi repo. Các thay đổi điều phối được mô tả trong [BAO_CAO_V6.md](BAO_CAO_V6.md).
+Bản này lấy `vngis-github-repo-v6.zip` làm nền, dùng `getDownloadURL` tải trực tiếp theo xã. Luồng batch export/Colab của các phiên bản sau đã được gỡ khỏi repo. Nhánh chỉ giữ đúng 8 file có trong ZIP; schema, điều phối, retry và kiểm thử được gộp vào hai file Python v6.
 
 ## Chuẩn bị
 
@@ -89,8 +89,8 @@ Không có tham số bảo đảm hết 429. Giữ mặc định qua pilot; nế
 
 ## Kiểm thử và giới hạn xác minh
 
-`python -m unittest discover -s tests -v` chạy schema, kiểm kê bằng Drive giả có file TIFF thật, chạy tiếp, thứ tự giai đoạn, 429/Retry-After, outbox và kiểm tra AST các hàm khoa học so với v6. `verify_pilot.py --remote gdrive:VNGISDash_2024_PILOT` kiểm tra dữ liệu thật sau pilot; báo lỗi nếu không có xã để xác minh.
+`python verify_pilot.py --self-test` chạy schema, kiểm kê bằng Drive giả có file TIFF thật, chạy tiếp, thứ tự giai đoạn, 429/Retry-After, outbox và kiểm tra AST các hàm khoa học so với v6. `verify_pilot.py --remote gdrive:VNGISDash_2024_PILOT` kiểm tra dữ liệu thật sau pilot; báo lỗi nếu không có xã để xác minh.
 
-Notebook khoa học gốc không nằm trong ZIP. [VNGIS_v6.ipynb](VNGIS_v6.ipynb) là notebook điều khiển/check offline và pilot của repo, không thay thế nguồn khoa học. Phải đối chiếu pilot với notebook khoa học khi có dữ liệu tham chiếu: `verify_pilot.py --root <thư mục đã mount> --notebook-dir <kết quả notebook> --notebook-gid <GID>`. Sai số CSV tối đa 1e-6; TIFF float yêu cầu giá trị pixel khớp trên cùng lưới.
+Notebook khoa học gốc không nằm trong ZIP; repo không giữ thêm notebook điều khiển ngoài danh sách v6. Phải đối chiếu pilot với notebook khoa học khi có dữ liệu tham chiếu: `verify_pilot.py --root <thư mục đã mount> --notebook-dir <kết quả notebook> --notebook-gid <GID>`. Sai số CSV tối đa 1e-6; TIFF float yêu cầu giá trị pixel khớp trên cùng lưới.
 
 Chưa xác minh Earth Engine/Drive thật trong môi trường phát triển nếu thiếu credentials khả dụng. Không tự chạy toàn quốc khi bàn giao.

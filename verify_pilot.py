@@ -12,8 +12,9 @@ Mã thoát: 0 nếu không có FAIL, 1 nếu có FAIL.
 import argparse, glob, json, os, subprocess, sys, tempfile
 from pathlib import Path
 
-import data_contract as D
-from v6_runtime import rclone_run
+import vngis_2024 as V
+D = V.D
+rclone_run = V.rclone_run
 
 import numpy as np
 import pandas as pd
@@ -200,7 +201,12 @@ def main():
     ap.add_argument("--notebook-dir", default="")
     ap.add_argument("--notebook-gid", default="")
     ap.add_argument("--report", default="")
+    ap.add_argument("--self-test", action="store_true", help="Chạy kiểm thử offline v6, không truy cập Google")
     a = ap.parse_args()
+    if a.self_test:
+        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        raise SystemExit(0 if result.wasSuccessful() else 1)
     root = a.root
     if a.remote:
         root = tempfile.mkdtemp(prefix="vngis_verify_")
@@ -251,6 +257,620 @@ def main():
         if rclone_run(["copyto", report, f"{a.remote}/_control/verify_report.md"]).returncode:
             any_fail = True
     sys.exit(1 if any_fail else 0)
+
+
+
+# Kiểm thử offline gộp trong file xác minh v6, không cần thư mục tests.
+N = R = V
+Q = sys.modules[__name__]
+V6_SCIENTIFIC_HASHES = 'mask_s2_sr 3de229fb0b7c280c8230d0708c0163deb6c0783b184b29329f698c65b17c88da\nadd_indices a01bd59402c5d468a6842261af48038e4558b90172ae5de033a3dfe9b87e3f9a\nmask_s2_clean c69947807eeed5e06f92304c6c5fbd9500e27baefda8dfb30815bb4e97996ade\n_month_dates cdd246ce2ce6e8460987c3774f4384a494d1e55adee58102ff07113139e84130\n_s2_windows 57807c1d792e21bb20cbd815509c4631699172bd8b80da405161128e205a243c\nday_image ca972a270d5b20ea8eac0d4e26997ad1294eb3350b6ce918a0123a2f8aa9dde9\nnight_image 8355dcb36775022ad5b29e2ae76d3b397807fff9b67ab3523054e0c7ae53b353\ntask3_all_months 44bc3bcb78bdca583c5d9ee548378886fe4a257d3fa987415503d55da2366c65\nmosaic_tiles c4a639414c849650dcb4b934ee5de3dc2dd66366825a66e21298057fdde987aa\ncompare_on_grid 437b167dba34e885cfd21293af9d583eed6ab1c0d31b9bc0e1e02aece88eb568\nwrite_tif 74e83ad0843b2480ae13213a6b268a09c6307e40ab0dc2e8f4d5d390add30005\nread_dbf 2c6a8ce557e376022b8046633346786bbdf369702b2f8da3b076f0fbf4caceba\ntask1_all_months 1cf4a2c27bbc7035b77dca10bded29df2c3c90b1f3cb3cbf4d64665da0932103\n'
+
+import json
+from pathlib import Path
+import tempfile
+import shutil
+import subprocess
+import sys
+import unittest
+from unittest.mock import patch, Mock
+
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.transform import Affine
+
+import vngis_2024 as V
+
+
+def admin(gids=('VNM.1.2_1', 'VNM.1.10_1')):
+    return pd.DataFrame([dict(GID_3=g, NAME_3='Xã ' + g, TYPE_3='Xa', GID_2='VNM.1_1',
+                              NAME_2='Huyện', GID_1='VNM.1_1', NAME_1='Tỉnh') for g in gids])
+
+
+def records(a, kind='day'):
+    rows = []
+    for gid in a['GID_3']:
+        for m in range(1, 13):
+            row = dict(GID_3=gid, YEAR=2024, MONTH=m)
+            row.update({c: float(m) for c in D.DAY_METRICS if kind == 'day'})
+            if kind == 'night':
+                row.update({c: float(m) for c in D.NIGHT_METRICS})
+                row['TIME'] = f'2024-{m:02d}'
+                if m == 1:
+                    row['TNL_MOM_GROWTH_PCT'] = np.nan
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def complete_progress(a):
+    images = {(k, g, m): ('done', '') for k in ['day', 'night']
+              for g in a['GID_3'] for m in range(1, 13)}
+    return D.progress(a, {k: records(a, k) for k in ['day', 'night']}, images)
+
+
+class ContractTests(unittest.TestCase):
+    def setUp(self):
+        self.a = admin()
+
+    def test_schema_legacy_migration_natural_order_and_names_by_gid(self):
+        old = records(self.a).iloc[::-1].copy()
+        old['NAME_3'] = 'wrong legacy name'
+        frame = D.normalize(old, self.a, 'day')
+        self.assertEqual(list(frame.columns), D.PREFIX + D.DAY_METRICS)
+        self.assertEqual(frame['gid_3'].drop_duplicates().tolist(), self.a['GID_3'].tolist())
+        self.assertEqual(frame.iloc[0]['name_3'], self.a.iloc[0]['NAME_3'])
+        self.assertEqual(frame.groupby('gid_3')['month'].apply(list).iloc[0], list(range(1, 13)))
+        self.assertTrue(frame['BLUE_mean'].eq(frame['month']).all())
+
+    def test_missing_month_becomes_blank_and_blocks_night(self):
+        old = records(self.a)
+        old = old[old['MONTH'] != 5]
+        frame = D.normalize(old, self.a, 'day')
+        self.assertEqual(len(frame), 24)
+        self.assertTrue(frame.loc[frame['month'].eq(5), D.DAY_METRICS].isna().all().all())
+        table = complete_progress(self.a)
+        table.loc[table['month'].eq(5), 'day_indices'] = 'pending'
+        with self.assertRaisesRegex(RuntimeError, 'Chặn phần đêm'):
+            D.require_day_complete(table)
+
+    def test_no_source_requires_evidence_and_keeps_nan(self):
+        blank = D.normalize(pd.DataFrame(), self.a, 'day').iloc[0]
+        self.assertEqual(D.metric_state(blank, 'day')[0], 'pending')
+        self.assertEqual(D.metric_state(blank, 'day', 0)[0], 'no_source')
+        images = {(k, g, m): ('done', '') for k in ['day', 'night'] for g in self.a.GID_3 for m in D.MONTHS}
+        sources = {(g, m, 'day_indices'): 0 for g in self.a.GID_3 for m in D.MONTHS}
+        table = D.progress(self.a, {'day': pd.DataFrame(), 'night': records(self.a, 'night')}, images, sources)
+        D.require_day_complete(table)
+        self.assertTrue(table.day_indices.eq('no_source').all())
+
+    def test_duplicates_wrong_year_and_unknown_gid(self):
+        rows = records(self.a)
+        self.assertEqual(len(D.normalize(pd.concat([rows, rows]), self.a, 'day')), 24)
+        conflict = rows.iloc[[0]].copy()
+        conflict['BLUE_mean'] = 100
+        with self.assertRaisesRegex(ValueError, 'trùng khóa'):
+            D.normalize(pd.concat([rows, conflict]), self.a, 'day')
+        for c, v in [('YEAR', 2023), ('MONTH', 13), ('GID_3', 'unknown')]:
+            wrong = rows.copy()
+            wrong.loc[0, c] = v
+            with self.assertRaises(ValueError):
+                D.normalize(wrong, self.a, 'day')
+
+    def test_preserve_valid_old_values_and_only_repair_missing(self):
+        old = records(self.a).iloc[1:].copy()
+        new = records(self.a)
+        new[D.DAY_METRICS] *= 100
+        result = D.merge_valid(old, new, self.a, 'day')
+        self.assertEqual(result.iloc[0].BLUE_mean, 100)
+        self.assertEqual(result.iloc[1].BLUE_mean, 2)
+
+    def test_merge_night_into_initially_empty_table(self):
+        frame = D.merge_valid(pd.DataFrame(), records(self.a, 'night'), self.a, 'night')
+        self.assertEqual(frame.iloc[0].TIME, '2024-01')
+        self.assertEqual(len(frame), 24)
+
+    def test_boundary_count_and_duplicate_gid_fail_explicitly(self):
+        with self.assertRaisesRegex(ValueError, '11,163'):
+            D.administrative_table(self.a)
+        with self.assertRaisesRegex(ValueError, 'mã trùng'):
+            D.administrative_table(pd.concat([self.a, self.a]), expected=None)
+
+    def test_full_gadm_scope_is_accepted_and_old_count_is_rejected(self):
+        self.assertEqual(D.EXPECTED_COMMUNES, 11163)
+        full = admin(tuple(f'VNM.1.{i}_1' for i in range(1, 11164)))
+        self.assertEqual(len(D.administrative_table(full)), 11163)
+        with self.assertRaisesRegex(ValueError, '11,136.*11,163'):
+            D.administrative_table(full.iloc[:11136])
+
+    def test_full_gadm_scope_still_rejects_duplicates_and_missing_names(self):
+        full = admin(tuple(f'VNM.1.{i}_1' for i in range(1, 11164)))
+        duplicate = full.copy()
+        duplicate.loc[1, 'GID_3'] = duplicate.loc[0, 'GID_3']
+        with self.assertRaisesRegex(ValueError, 'mã trùng'):
+            D.administrative_table(duplicate)
+        blank = full.copy()
+        blank.loc[1, 'NAME_3'] = ''
+        with self.assertRaisesRegex(ValueError, 'thông tin hành chính trống'):
+            D.administrative_table(blank)
+
+    def test_night_columns_and_first_month_growth_nan_is_valid(self):
+        frame = D.normalize(records(self.a, 'night'), self.a, 'night')
+        self.assertEqual(list(frame), D.PREFIX + D.NIGHT_METRICS)
+        self.assertEqual(D.metric_state(frame.iloc[0], 'night')[0], 'done')
+
+    def test_gate_rejects_missing_month_duplicate_or_partial_state(self):
+        table = complete_progress(self.a)
+        D.require_day_complete(table)
+        for wrong in [table.iloc[1:], pd.concat([table, table.iloc[[0]]])]:
+            with self.assertRaises(RuntimeError):
+                D.require_day_complete(wrong)
+        for state in ['pending', 'running', 'failed']:
+            wrong = table.copy()
+            wrong.loc[0, 'day_image'] = state
+            with self.assertRaises(RuntimeError):
+                D.require_day_complete(wrong)
+
+    def test_resume_interrupted_work_but_recheck_done(self):
+        prev = complete_progress(self.a)
+        prev.loc[0, 'day_image'] = 'running'
+        frames = {k: records(self.a, k) for k in ['day', 'night']}
+        resumed = D.progress(self.a, frames, {}, previous=prev)
+        self.assertEqual(resumed.iloc[0].day_image, 'failed')
+        self.assertEqual(resumed.iloc[1].day_image, 'pending')
+        recovered = D.progress(self.a, frames, {('day', self.a.iloc[0].GID_3, 1): ('done', '')}, previous=prev)
+        self.assertEqual(recovered.iloc[0].day_image, 'done')
+
+import ast
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import threading
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import numpy as np
+import pandas as pd
+import requests
+from rasterio.transform import Affine
+
+import vngis_2024 as V
+
+
+class ScientificTests(unittest.TestCase):
+    def test_fetch_plan_queries_only_active_phase_sources(self):
+        collection = Mock()
+        collection.filterBounds.return_value = collection
+        collection.filterDate.return_value = collection
+        collection.size.return_value = 1
+        fc = Mock();fc.size.return_value=1
+        with patch.object(V.ee,'ImageCollection',return_value=collection) as source, patch.object(V.ee,'List',side_effect=lambda x:x), patch.object(V.ee,'Dictionary',side_effect=lambda x:x), patch.object(V,'ee_getinfo',side_effect=lambda x:x):
+            _, day = V.fetch_plan(fc, 'geom', 'day')
+            self.assertEqual({c.args[0] for c in source.call_args_list},{V.S2_COLLECTION})
+            self.assertEqual(day[1]['indices_count'],1)
+            source.reset_mock()
+            _, night = V.fetch_plan(fc, 'geom', 'night')
+            self.assertEqual({c.args[0] for c in source.call_args_list},{V.VIIRS_A,V.VIIRS_B})
+            self.assertEqual(night[1]['viirs'],V.VIIRS_A)
+
+    def test_original_v6_scientific_functions_are_unchanged(self):
+        root = Path(V.__file__).resolve().parent
+        functions = {n.name: n for n in ast.parse((root/'vngis_2024.py').read_text()).body
+                     if isinstance(n, ast.FunctionDef)}
+        for line in V6_SCIENTIFIC_HASHES.splitlines():
+            name, expected = line.split()
+            if name == 'task1_all_months':
+                current = functions[name]
+                self.assertEqual(current.args.args[-1].arg,'months')
+                current.args.args.pop()
+                current.args.defaults.clear()
+                loop = next(n for n in current.body if isinstance(n,ast.For))
+                self.assertEqual(ast.dump(loop.iter),ast.dump(ast.parse('MONTHS if months is None else months',mode='eval').body))
+                loop.iter = ast.Name(id='MONTHS',ctx=ast.Load())
+            actual = hashlib.sha256(ast.dump(functions[name], include_attributes=False).encode()).hexdigest()
+            self.assertEqual(actual, expected, name)
+
+    def test_pilot_does_not_increase_workers_and_rejects_quality_reduction(self):
+        code = 'import vngis_2024 as v; print(v.N_WORKERS)'
+        env = {**os.environ, 'VNGIS_MODE': 'pilot', 'VNGIS_PILOT_N': '8', 'VNGIS_WORKERS': '1'}
+        result = subprocess.run([os.sys.executable, '-c', code], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '1')
+        for name, value in [('VNGIS_DAY_BANDS', '6'), ('VNGIS_DAY_FORMAT', 'int16')]:
+            result = subprocess.run([os.sys.executable, '-c', code], env={**env, name: value}, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
+
+class RateTests(unittest.TestCase):
+    def setUp(self):
+        logger = patch.object(R.log, 'disabled', True)
+        logger.start(); self.addCleanup(logger.stop)
+        self.now = 0.
+        self.event = Mock()
+        self.event.wait.side_effect = self.advance
+        self.gate = N.RequestGate(1, 2, lambda: None, self.event, clock=lambda: self.now)
+        flags = ['--transfers','2','--checkers','4','--tpslimit','2.0','--tpslimit-burst','2','--retries','1','--low-level-retries','1']
+        controlled = patch.object(V,'RCLONE_COMMON',flags)
+        controlled.start(); self.addCleanup(controlled.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+        return False
+
+    def error(self, code=429, header='7'):
+        response = requests.Response()
+        response.status_code = code
+        response.headers['Retry-After'] = header
+        return requests.HTTPError(response=response)
+
+    def test_retry_after_seconds_and_http_date(self):
+        self.assertEqual(N.retry_after('7'), 7)
+        self.assertEqual(N.retry_after('Thu, 08 Oct 2026 04:00:10 GMT', datetime(2026,10,8,4,0,0,tzinfo=timezone.utc)), 10)
+        self.assertIsNone(N.retry_after('invalid'))
+        self.assertLessEqual(N.retry_delay(10), 120)
+
+    def test_429_cooldown_is_shared_and_semaphore_released_during_backoff(self):
+        def defer(service, delay, throttled):
+            self.assertTrue(self.gate.semaphore.acquire(blocking=False))
+            self.gate.semaphore.release()
+            original(service, delay, throttled)
+        original = self.gate.defer
+        operation = Mock(side_effect=[self.error(), 'success'])
+        with patch.object(self.gate, 'defer', side_effect=defer):
+            self.assertEqual(self.gate.call('Earth Engine', operation, 2), 'success')
+        self.assertGreaterEqual(self.now, 7)
+        self.assertEqual(self.gate.throttles['Earth Engine'], 1)
+        self.gate.defer('Image download', 11, True)
+        before = self.now
+        with self.gate.slot('Earth Engine'):
+            self.assertGreaterEqual(self.now-before, 11)
+
+    def test_ee_and_image_download_share_start_rate(self):
+        with self.gate.slot('Earth Engine'):
+            pass
+        with self.gate.slot('Image download'):
+            self.assertGreaterEqual(self.now, .5)
+
+    def test_exhausted_429_is_bounded_and_stop_interrupts_wait(self):
+        operation = Mock(side_effect=self.error(header='1'))
+        with self.assertRaisesRegex(RuntimeError, '6/6'):
+            self.gate.call('Earth Engine', operation, 6)
+        self.assertEqual(operation.call_count, 6)
+        self.assertEqual(self.gate.throttles['Earth Engine'], 6)
+        stopped = N.RequestGate(1, 2, Mock(side_effect=V.StopRequested()), threading.Event())
+        with self.assertRaises(V.StopRequested):
+            stopped.wait(100)
+
+    def test_drive_commands_use_throttle_flags_and_do_not_retry_permission_errors(self):
+        with patch.object(V, 'REQUEST_GATE', self.gate), patch.object(R.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', '403 forbidden')) as run:
+            R.rclone_run(['lsjson', 'gdrive:sample'])
+            self.assertEqual(run.call_count, 1)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index('--tpslimit')+1], '2.0')
+            self.assertEqual(argv[argv.index('--transfers')+1], '2')
+            self.assertEqual(argv[argv.index('--checkers')+1], '4')
+
+    def test_drive_retry_after_and_successful_command_are_not_replayed(self):
+        results = [subprocess.CompletedProcess([],1,'','HTTP 429\nRetry-After: 8'),
+                   subprocess.CompletedProcess([],0,'success','Recovered from 429')]
+        with patch.object(V,'REQUEST_GATE',self.gate),patch.object(R.subprocess,'run',side_effect=results) as run:
+            self.assertEqual(R.rclone_run(['moveto','source','destination']).returncode,0)
+            self.assertEqual(run.call_count,2)
+        self.assertGreaterEqual(self.now,8)
+
+    def test_download_429_honors_header_without_logging_signed_url(self):
+        image = Mock()
+        image.getDownloadURL.return_value = 'https://example.invalid/?token=secret'
+        first = requests.Response()
+        first.status_code = 429
+        first.headers['Retry-After'] = '9'
+        first._content = b'throttled'
+        second = requests.Response()
+        second.status_code = 200
+        second._content = b'x'*256
+        with patch.object(V, 'REQUEST_GATE', self.gate), patch.object(V, '_http_get', side_effect=[first, second]):
+            self.assertEqual(V.fetch_geotiff_bytes(image, 'region', 20), b'x'*256)
+        self.assertGreaterEqual(self.now, 9)
+        self.assertEqual(image.getDownloadURL.call_args.args[0]['scale'], 20)
+
+
+class FakeDrive:
+    def __init__(self, root, local):
+        self.root, self.local = Path(root), Path(local)
+        self.base = 'fake:VNGISDash_2024_PILOT'
+        self.downloads = []
+        self.uploads = []
+        self.root.mkdir(parents=True)
+
+    def fetch(self, rel, dest, optional=False):
+        source, dest = self.root/rel, Path(dest)
+        if not source.exists() and optional:
+            return None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        self.downloads.append(rel)
+        return dest
+
+    def metadata(self, path, relative):
+        return dict(Path=str(relative), Size=path.stat().st_size, ModTime=str(path.stat().st_mtime_ns),
+                    Hashes={'md5': hashlib.md5(path.read_bytes()).hexdigest()})
+
+    def listing(self, rel):
+        root = self.root/rel
+        return [self.metadata(p, p.relative_to(root)) for p in sorted(root.rglob('*')) if p.is_file()]
+
+    def stat(self, rel, **kwargs):
+        path = self.root/rel
+        return self.metadata(path, rel) if path.is_file() else None
+
+    def put(self, path, rel, backup=True):
+        destination = self.root/rel
+        if destination.exists() and backup:
+            saved = self.root/f'_control/backups/{len(self.uploads)}/{rel}'
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(destination, saved)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, str(destination)+'.part')
+        Path(str(destination)+'.part').replace(destination)
+        self.uploads.append(rel)
+
+    def pull_history(self):
+        for rel in ['_control/status', '_control/parts']:
+            for entry in self.listing(rel):
+                self.fetch(f"{rel}/{entry['Path']}", self.local/rel/entry['Path'])
+
+    def flush_outbox(self):
+        pass
+
+
+class EngineTests(unittest.TestCase):
+    def setUp(self):
+        logger = patch.object(R.log, 'disabled', True)
+        logger.start(); self.addCleanup(logger.stop)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.a = admin(('VNM.1.2_1',))
+        self.gid = self.a.iloc[0].GID_3
+        self.drive = FakeDrive(root/'remote', root/'local')
+        self.engine = R.Engine(self.a, self.drive)
+        for obj, name, value in [(V,'MIN_FREE_GB',0), (V,'PREFLIGHT',False), (V,'MAX_ATTEMPTS',1),
+                                 (V,'MONTH_THREADS',2), (V,'N_WORKERS',2), (V,'UPLOAD_EVERY_SEC',300)]:
+            if hasattr(obj, name):
+                patcher = patch.object(obj,name,value)
+                patcher.start(); self.addCleanup(patcher.stop)
+        for name in ['communes_fc']:
+            patcher = patch.object(V,name,Mock());patcher.start();self.addCleanup(patcher.stop)
+        patcher = patch.object(V.ee.Filter,'eq',return_value=Mock());patcher.start();self.addCleanup(patcher.stop)
+        patcher = patch.dict(os.environ,{'VNGIS_MIN_FREE_GB':'0'});patcher.start();self.addCleanup(patcher.stop)
+        V.STOP_EVENT.clear();V.STOP_REASON[0]=None
+
+    def write_image(self, month, kind='day'):
+        ctx = self.engine.contexts[self.gid]
+        path = self.drive.root/ctx['rel_'+kind+'_dir']/(V.day_name(ctx,month) if kind == 'day' else V.night_name(ctx,month))
+        self.image_bytes(path, 20 if kind == 'day' else 500)
+        return path
+
+    @staticmethod
+    def image_bytes(path, scale):
+        Path(path).parent.mkdir(parents=True,exist_ok=True)
+        bands = D.DAY_BANDS if scale == 20 else ['avg_rad','cf_cvg']
+        V.write_tif(str(path),np.ones((len(bands),4,4),dtype='float64'),
+                    Affine(scale/111319.49079327357,0,105,0,-scale/111319.49079327357,21),'EPSG:4326',-9999,bands)
+
+    def fill_day(self):
+        for m in D.MONTHS:
+            self.write_image(m)
+        path = self.drive.root/'CSV/day_indices.csv'
+        path.parent.mkdir(exist_ok=True)
+        records(self.a).to_csv(path,index=False)
+
+    def plan(self, fc, geom, kind):
+        return 1,{m:dict(image_count=1,indices_count=1,s2_window=0,viirs=V.VIIRS_A) for m in D.MONTHS}
+
+    def fake_download(self,image,region,scale,path,label):
+        self.image_bytes(path,scale)
+
+    def test_inventory_migrates_with_backup_and_does_not_trust_old_done(self):
+        self.fill_day()
+        original = (self.drive.root/'CSV/day_indices.csv').read_bytes()
+        self.engine.inventory()
+        backups = list((self.drive.root/'_control/backups').rglob('day_indices.csv'))
+        self.assertEqual(backups[0].read_bytes(),original)
+        self.assertEqual(list(pd.read_csv(self.drive.root/'CSV/day_indices.csv')),D.COLUMNS['day'])
+        self.write_image(5).unlink()
+        table = self.engine.inventory()
+        self.assertEqual(table.loc[table.month.eq(5),'day_image'].iloc[0],'pending')
+        with self.assertRaises(RuntimeError):
+            D.require_day_complete(table)
+        self.assertEqual(len(table),12)
+
+    def test_corrupt_file_cache_is_reused_until_file_changes(self):
+        self.fill_day()
+        self.write_image(4).write_bytes(b'corrupt')
+        self.engine.inventory()
+        self.assertEqual(self.engine.table.loc[3,'day_image'],'failed')
+        with patch.object(D,'validate_image',wraps=D.validate_image) as decode:
+            self.engine.inventory()
+            decode.assert_not_called()
+        self.write_image(4)
+        with patch.object(D,'validate_image',wraps=D.validate_image) as decode:
+            self.engine.inventory()
+            self.assertEqual(decode.call_count,1)
+        D.require_day_complete(self.engine.table)
+
+    def test_interrupted_inventory_checkpoints_and_only_decodes_remaining_files(self):
+        self.fill_day()
+        with patch.object(V,'check_stop',side_effect=[None,None,V.StopRequested()]):
+            with self.assertRaises(V.StopRequested):
+                self.engine.inventory()
+        cache = self.drive.root/'_control/validated_images.json'
+        self.assertEqual(len(json.loads(cache.read_text())),2)
+        with patch.object(D,'validate_image',wraps=D.validate_image) as decode:
+            self.engine.inventory()
+            self.assertEqual(decode.call_count,10)
+        D.require_day_complete(self.engine.table)
+
+    def test_missing_indices_only_queries_missing_month_and_keeps_valid_values(self):
+        self.fill_day()
+        rows = records(self.a).iloc[1:]
+        rows.to_csv(self.drive.root/'CSV/day_indices.csv',index=False)
+        self.engine.inventory()
+        def task(fc,months):
+            self.assertEqual(months,[1])
+            incoming = records(self.a).iloc[[0]].copy()
+            incoming[D.DAY_METRICS] *= 100
+            return incoming.rename(columns={'GID_3':'GID_3','MONTH':'MONTH'}).to_dict('records')
+        with patch.object(V,'fetch_plan',side_effect=self.plan),patch.object(V,'task1_all_months',side_effect=task),patch.object(V,'download_tif') as download:
+            self.assertTrue(self.engine.run_phase('day'))
+            download.assert_not_called()
+        self.assertEqual(self.engine.frames['day'].iloc[0].BLUE_mean,100)
+        self.assertEqual(self.engine.frames['day'].iloc[1].BLUE_mean,2)
+
+    def test_missing_image_only_downloads_that_month(self):
+        self.fill_day();self.write_image(7).unlink()
+        self.engine.inventory()
+        with patch.object(V,'fetch_plan',side_effect=self.plan),patch.object(V,'day_image'),patch.object(V,'task1_all_months') as indices,patch.object(V,'download_tif',side_effect=self.fake_download) as download:
+            self.assertTrue(self.engine.run_phase('day'))
+            indices.assert_not_called()
+            self.assertEqual(download.call_count,1)
+        self.engine.inventory()
+        D.require_day_complete(self.engine.table)
+
+    def test_confirmed_no_source_keeps_twelve_blank_rows(self):
+        self.engine.inventory()
+        plan = {m:dict(image_count=0,indices_count=0,s2_window=None) for m in D.MONTHS}
+        with patch.object(V,'fetch_plan',return_value=(1,plan)),patch.object(V,'task1_all_months') as task,patch.object(V,'download_tif') as download:
+            self.assertTrue(self.engine.run_phase('day'))
+            task.assert_not_called();download.assert_not_called()
+        self.engine.inventory()
+        D.require_day_complete(self.engine.table)
+        self.assertTrue(self.engine.table.day_image.eq('no_source').all())
+        self.assertTrue(self.engine.frames['day'][D.DAY_METRICS].isna().all().all())
+
+    def test_no_source_is_not_inferred_from_failed_requests_and_night_is_blocked(self):
+        self.engine.inventory()
+        with patch.object(V,'fetch_plan',side_effect=RuntimeError('HTTP 429 quota exhausted')):
+            self.assertFalse(self.engine.run_phase('day'))
+        self.assertTrue(self.engine.table.day_image.eq('failed').all())
+        self.assertFalse(self.engine.sources)
+        with patch.object(V,'fetch_plan') as query,patch.object(V,'task3_all_months') as task:
+            with self.assertRaises(RuntimeError):
+                self.engine.run_phase('night')
+            query.assert_not_called();task.assert_not_called()
+
+    def test_actual_day_then_night_pipeline_and_verifier(self):
+        self.engine.inventory()
+        with patch.object(V,'fetch_plan',side_effect=self.plan),patch.object(V,'day_image'),patch.object(V,'night_image'),patch.object(V,'task1_all_months',return_value=records(self.a).to_dict('records')),patch.object(V,'task3_all_months',return_value=records(self.a,'night')),patch.object(V,'download_tif',side_effect=self.fake_download):
+            self.assertTrue(self.engine.run_phase('day'))
+            self.assertTrue(self.engine.table.night_image.eq('pending').all())
+            self.engine.inventory()
+            self.assertTrue(self.engine.run_phase('night'))
+        self.engine.inventory()
+        checks = Q.verify_commune(self.drive.root,self.gid,{},self.engine.frames['day'],self.engine.frames['night'])
+        self.assertTrue(all(level == 'PASS' for _,level,_ in checks),checks)
+
+    def test_asset_missing_gid_remains_failed_not_skipped(self):
+        self.engine.inventory()
+        full = admin(tuple([self.gid]+[f'VNM.9.{i}_1' for i in range(11162)]))
+        with patch.object(V,'ee_getinfo',return_value=list(full.GID_3)[1:]):
+            with self.assertRaisesRegex(ValueError,'thiếu 1'):
+                self.engine.check_asset(full)
+        self.assertTrue(self.engine.table.day_image.eq('failed').all())
+
+    def test_failed_attempt_limit_survives_restart(self):
+        self.engine.inventory()
+        with patch.object(V,'fetch_plan',side_effect=RuntimeError('HTTP 429 exhausted')):
+            self.assertFalse(self.engine.run_phase('day'))
+        resumed = R.Engine(self.a,self.drive)
+        resumed.inventory()
+        with patch.object(V,'fetch_plan') as query:
+            self.assertFalse(resumed.run_phase('day'))
+            query.assert_not_called()
+
+    def test_recover_valid_legacy_parts_if_csv_missing(self):
+        part = self.drive.root/'_control/parts/day_legacy.jsonl'
+        part.parent.mkdir(parents=True)
+        part.write_text(''.join(json.dumps(r)+'\n' for r in records(self.a).to_dict('records')))
+        self.engine.inventory()
+        self.assertTrue(self.engine.table.day_indices.eq('done').all())
+        self.assertEqual(len(self.engine.frames['day']),12)
+
+    def test_main_stops_after_day_failure_and_reports_final_sync_failure(self):
+        fake = Mock()
+        fake.drive.stat.return_value=None
+        fake.root = self.drive.local
+        fake.table = complete_progress(self.a)
+        fake.run_phase.return_value=False
+        with patch.object(R,'Engine',return_value=fake),patch.object(V,'build_admin_table',return_value=self.a),patch.object(V,'load_targets',return_value=self.a),patch.object(V,'init_earth_engine'),patch.object(V,'setup_logging'),patch.object(V,'install_signal_handlers'):
+            self.assertEqual(R.pipeline_main(V),1)
+            fake.run_phase.assert_called_once_with('day')
+            fake.checkpoint.side_effect=RuntimeError('Drive quota')
+            self.assertEqual(R.pipeline_main(V,step='inventory'),1)
+
+    def test_fatal_download_stop_is_a_failure_not_a_manual_stop(self):
+        fake=Mock();fake.drive.stat.return_value=None;fake.root=self.drive.local
+        fake.inventory.side_effect=V.StopRequested()
+        with patch.object(R,'Engine',return_value=fake),patch.object(V,'build_admin_table',return_value=self.a),patch.object(V,'load_targets',return_value=self.a),patch.object(V,'setup_logging'),patch.object(V,'install_signal_handlers'),patch.object(V,'STOP_REASON',['fatal']):
+            self.assertEqual(R.pipeline_main(V),1)
+
+    def test_atomic_upload_failure_preserves_outbox_snapshot(self):
+        drive = R.Drive('gdrive:pilot',self.drive.local)
+        path = self.drive.local/'snapshot.csv'
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text('old valid data')
+        with patch.object(drive,'_put',side_effect=RuntimeError('quota')):
+            with self.assertRaises(RuntimeError):
+                drive.put(path,'CSV/day_indices.csv')
+        temporary = path.with_suffix('.part');temporary.write_text('new data');temporary.replace(path)
+        jobs = list((drive.local/'_control/outbox').glob('*/manifest.json'))
+        self.assertEqual(len(jobs),1)
+        self.assertEqual((jobs[0].parent/'payload').read_text(),'old valid data')
+        with patch.object(drive,'_put') as upload:
+            drive.flush_outbox()
+            self.assertEqual(upload.call_args.args[1],'CSV/day_indices.csv')
+            self.assertTrue(upload.call_args.args[2])
+        self.assertFalse(list((drive.local/'_control/outbox').glob('*/manifest.json')))
+
+    def test_repeated_replacements_keep_distinct_backups(self):
+        drive = R.Drive('gdrive:pilot',self.drive.local)
+        with patch.object(drive,'stat',return_value={'Size':1}),patch.object(drive,'command',return_value='') as command:
+            drive._put('local.csv','CSV/day_indices.csv')
+            drive._put('local.csv','CSV/day_indices.csv')
+        targets = [call.args[0][2] for call in command.call_args_list if '/backups/' in call.args[0][2]]
+        self.assertEqual(len(targets),2)
+        self.assertNotEqual(targets[0],targets[1])
+
+    def test_processing_interruption_resumes_without_recomputing_valid_metrics(self):
+        self.engine.inventory()
+        def stop_on_third(image,region,scale,path,label):
+            if label.endswith('/3'):
+                V.request_stop('deadline')
+                raise V.StopRequested()
+            self.fake_download(image,region,scale,path,label)
+        with patch.object(V,'MAX_ATTEMPTS',3),patch.object(V,'MONTH_THREADS',1),patch.object(V,'fetch_plan',side_effect=self.plan),patch.object(V,'day_image'),patch.object(V,'task1_all_months',return_value=records(self.a).to_dict('records')),patch.object(V,'download_tif',side_effect=stop_on_third):
+            with self.assertRaises(V.StopRequested):
+                self.engine.run_phase('day')
+        self.engine.checkpoint(force=True)
+        V.STOP_EVENT.clear();V.STOP_REASON[0]=None
+        resumed = R.Engine(self.a,self.drive)
+        resumed.inventory()
+        with patch.object(V,'MAX_ATTEMPTS',3),patch.object(V,'fetch_plan',side_effect=self.plan),patch.object(V,'day_image'),patch.object(V,'task1_all_months') as indices,patch.object(V,'download_tif',side_effect=self.fake_download) as download:
+            self.assertTrue(resumed.run_phase('day'))
+            indices.assert_not_called()
+            self.assertEqual(download.call_count,10)
+
+    def test_verifier_rejects_empty_run(self):
+        with patch('sys.argv',['verify_pilot.py','--root',str(self.drive.root)]),patch('builtins.print'):
+            with self.assertRaises(SystemExit) as result:
+                Q.main()
+        self.assertEqual(result.exception.code,1)
+
+
 
 
 if __name__ == "__main__":

@@ -20,9 +20,9 @@ Nguồn: `VNGISDash_Task123_Merged_final.ipynb`. Pipeline giữ 3 chức năng: 
 
 ## Điều phối thay đổi sau v6
 
-- `v6_runtime.py` giữ lịch ngày → kiểm kê hợp lệ → đêm trên toàn phạm vi. `fetch_plan(..., phase)` chỉ truy vấn nguồn của giai đoạn hiện tại.
+- `Engine` trong `vngis_2024.py` giữ lịch ngày → kiểm kê hợp lệ → đêm trên toàn phạm vi. `fetch_plan(..., phase)` chỉ truy vấn nguồn của giai đoạn hiện tại.
 - `task1_all_months(..., months)` giữ nguyên phép tính v6, chỉ dựng graph cho tháng cần bổ sung. Task 3.2 vẫn tính chuỗi nguồn v6 rồi chỉ ghi sửa các tháng thiếu/lỗi.
 - Hai CSV thêm hành chính chuẩn bằng GID, cột tiền tố viết thường, 12 dòng/GID; tháng no_source để trống. Không thay đổi công thức chỉ số hoặc cách xử lý chuỗi có tháng thiếu của v6.
 - Ảnh ngày luôn đủ 10 kênh float; không dùng các tùy chọn int16/6 kênh của ZIP. Ảnh đêm vẫn Float64.
 - Request EE và tải ảnh có giới hạn dùng chung, pacing/cooldown/retry và checkpoint. Việc thay đổi này không thay cửa sổ, scale, reducer hoặc giá trị pixel.
-- `tests/v6_scientific.sha256` lưu hash AST từ ZIP v6 (Python 3.11) cho các hàm khoa học. Kiểm thử so sánh mã và Drive giả không thay thế đối chiếu số liệu thật với notebook gốc.
+- `V6_SCIENTIFIC_HASHES` trong `verify_pilot.py` lưu hash AST từ ZIP v6 (Python 3.11) cho các hàm khoa học. Kiểm thử so sánh mã và Drive giả không thay thế đối chiếu số liệu thật với notebook gốc.

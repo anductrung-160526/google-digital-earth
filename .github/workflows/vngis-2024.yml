@@ -10,6 +10,9 @@ name: VNGISDash 2024 v6 (ngày trước, đêm sau)
 # Luôn bấm "Run workflow". Không dùng "Re-run all jobs" (nút đó chạy lại với input cũ).
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       mode:
@@ -82,7 +85,23 @@ env:
   VNGIS_MIN_FREE_GB: "6"
 
 jobs:
+  tests:
+    name: Kiểm thử offline v6
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python verify_pilot.py --self-test
+
   gate:
+    if: github.event_name == 'workflow_dispatch'
     name: Kiểm tra file STOP
     runs-on: ubuntu-latest
     outputs:
@@ -101,7 +120,7 @@ jobs:
   run:
     name: Chạy một lượt
     needs: gate
-    if: needs.gate.outputs.stop != 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.gate.outputs.stop != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
@@ -173,7 +192,7 @@ jobs:
           echo "Thư mục đích trên Drive: $VNGIS_DRIVE_FOLDER"
 
       - name: Kiểm thử offline trước khi chạy
-        run: python -m unittest discover -s tests -v
+        run: python verify_pilot.py --self-test
 
       - name: Chạy pipeline
         id: pipeline

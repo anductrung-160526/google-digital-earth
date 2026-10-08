@@ -13,7 +13,7 @@ Cấu trúc đầu ra (cấp 1 = thư mục trên Drive):
   CSV/day_indices.csv, CSV/night_indices.csv         (gộp toàn quốc)
   _control/                                         (trạng thái, log, báo cáo)
 
-Nền khoa học v6 được giữ nguyên. Điều phối trong v6_runtime.py kiểm kê dữ liệu thật,
+Nền khoa học v6 được giữ nguyên. Điều phối trong Engine kiểm kê dữ liệu thật,
 hoàn tất toàn bộ ngày rồi mới xử lý đêm. Chỉ tải ảnh thiếu/lỗi; chỉ số cũ hợp lệ được giữ.
 
 Chạy:
@@ -26,8 +26,6 @@ Mã thoát: 0 bước yêu cầu hoàn tất | 1 lỗi/hết giới hạn thử 
 import os, io, re, sys, json, time, glob, math, shutil, zipfile, signal, logging, calendar, struct
 import threading, subprocess, unicodedata, warnings
 sys.modules.setdefault("vngis_2024", sys.modules[__name__])
-import data_contract as D
-from request_control import RequestGate, retry_delay, status_code
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -37,6 +35,438 @@ import requests
 
 warnings.filterwarnings("ignore")
 
+
+# Schema và điều khiển request được gộp để chỉ giữ các file v6.
+"""Shared 2024 output contract and evidence-based, per-month inventory.
+
+This module does not authenticate, submit exports, or write to Drive.
+"""
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+CONTRACT_YEAR = 2024
+CONTRACT_MONTHS = range(1, 13)
+# Full Vietnam level-3 scope in GADM 4.1, explicitly selected by the user.
+CONTRACT_EXPECTED_COMMUNES = 11163
+CONTRACT_ADMIN_COLUMNS = ['gid_3', 'name_3', 'type_3', 'gid_2', 'name_2', 'gid_1', 'name_1']
+CONTRACT_KEY = ['gid_3', 'year', 'month']
+CONTRACT_PREFIX = CONTRACT_ADMIN_COLUMNS + ['year', 'month']
+CONTRACT_DAY_BANDS = ['BLUE', 'GREEN', 'RED', 'NIR', 'SWIR1', 'SWIR2', 'NDVI', 'NDBI', 'MNDWI', 'BSI']
+CONTRACT_DAY_METRICS = [f'{b}_{s}' for b in CONTRACT_DAY_BANDS for s in ('mean', 'stdDev')]
+CONTRACT_NIGHT_METRICS = ['TIME', 'COMMUNE_AREA_HA', 'TNL', 'MEAN_RAD', 'STD_RAD', 'MIN_RAD', 'MAX_RAD',
+                 'SPATIAL_CV', 'LIT_PIXELS', 'LIT_AREA_HA', 'ELECTRIFICATION_RATIO_PCT',
+                 'LIT_POP_PROXY', 'CLOUD_FREE_OBS', 'TNL_MA3', 'TNL_MOM_GROWTH_PCT']
+CONTRACT_COLUMNS = {'day': CONTRACT_PREFIX + CONTRACT_DAY_METRICS, 'night': CONTRACT_PREFIX + CONTRACT_NIGHT_METRICS}
+CONTRACT_FIELDS = ['day_image', 'day_indices', 'night_image', 'night_indices']
+CONTRACT_TERMINAL = {'done', 'no_source'}
+CONTRACT_STATES = {'pending', 'running', 'done', 'no_source', 'failed'}
+CONTRACT_IMAGE_RE = re.compile(r'^(.+)_(day|night)_2024(0[1-9]|1[0-2])\.tif$')
+CONTRACT_VALIDATION_VERSION = 1
+
+
+def contract_natural_key(gid):
+    return tuple((0, int(x)) if x.isdigit() else (1, x) for x in re.split(r'(\d+)', str(gid)))
+
+
+def contract_administrative_table(admin, expected=CONTRACT_EXPECTED_COMMUNES):
+    admin = admin.rename(columns={c: c.lower() for c in admin.columns if c.lower() in CONTRACT_ADMIN_COLUMNS})
+    missing = set(CONTRACT_ADMIN_COLUMNS) - set(admin.columns)
+    if missing:
+        raise ValueError(f'Bảng địa giới thiếu cột: {sorted(missing)}')
+    admin = admin[CONTRACT_ADMIN_COLUMNS].copy()
+    if admin.isna().any().any() or admin.eq('').any().any() or admin['gid_3'].duplicated().any():
+        raise ValueError('Bảng địa giới có mã trùng hoặc thông tin hành chính trống')
+    if expected is not None and len(admin) != expected:
+        raise ValueError(f'Phạm vi địa giới có {len(admin):,} xã; yêu cầu {expected:,}. '
+                         'GADM/asset có thể khác bộ địa giới năm 2024. Không tự thêm hoặc bỏ xã; '
+                         'cần cung cấp bảng địa giới đúng phạm vi.')
+    return admin.astype(str)
+
+
+def contract_aliases(frame):
+    """Unify old uppercase identifiers; reject conflicting duplicate identifiers."""
+    df = frame.copy()
+    for old in list(df.columns):
+        new = old.lower()
+        if new not in CONTRACT_PREFIX or old == new:
+            continue
+        if new in df:
+            both = df[old].notna() & df[new].notna()
+            if not df.loc[both, old].astype(str).eq(df.loc[both, new].astype(str)).all():
+                raise ValueError(f'Cột {old}/{new} mâu thuẫn')
+            df[new] = df[new].combine_first(df[old])
+            df = df.drop(columns=old)
+        else:
+            df = df.rename(columns={old: new})
+    return df
+
+
+def contract_normalize(frame, admin, kind, complete=True):
+    """Join names by GID, preserve scientific values, and optionally create 12 rows/GID.
+
+    Missing rows become NaN, never zero. Conflicting duplicates are an error so an
+    arbitrary old/new row cannot silently replace a scientific measurement.
+    """
+    df = contract_aliases(frame)
+    admin = contract_administrative_table(admin, expected=None)
+    metrics = CONTRACT_DAY_METRICS if kind == 'day' else CONTRACT_NIGHT_METRICS
+    if df.empty:
+        df = pd.DataFrame(columns=CONTRACT_KEY + metrics)
+    if not set(CONTRACT_KEY).issubset(df):
+        raise ValueError('CSV thiếu gid_3/year/month (hoặc GID_3/YEAR/MONTH)')
+    unknown = set(df['gid_3'].dropna().astype(str)) - set(admin['gid_3'])
+    if unknown:
+        raise ValueError(f'CSV có GID ngoài địa giới: {sorted(unknown)[:10]}')
+    for c in ['year', 'month']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    if df['gid_3'].isna().any() or not df['year'].eq(CONTRACT_YEAR).all() or not df['month'].isin(CONTRACT_MONTHS).all():
+        raise ValueError('CSV có mã trống hoặc năm/tháng ngoài 2024/1..12')
+    df['gid_3'] = df['gid_3'].astype(str)
+    df = df.reindex(columns=CONTRACT_KEY + metrics)
+    for c in metrics:
+        if c != 'TIME':
+            original = df[c]
+            df[c] = pd.to_numeric(original, errors='coerce')
+            if (original.notna() & df[c].isna()).any():
+                raise ValueError(f'Chỉ số {c} có giá trị không phải số')
+        else:
+            df[c] = df[c].astype(object)
+    df = df.drop_duplicates()
+    if df.duplicated(CONTRACT_KEY).any():
+        raise ValueError('CSV có bản ghi trùng khóa với chỉ số mâu thuẫn')
+    if complete:
+        grid = pd.MultiIndex.from_product([admin['gid_3'], [CONTRACT_YEAR], CONTRACT_MONTHS], names=CONTRACT_KEY).to_frame(index=False)
+        df = grid.merge(df, on=CONTRACT_KEY, how='left', validate='one_to_one')
+    df = df.merge(admin, on='gid_3', how='left', validate='many_to_one')
+    df['year'], df['month'] = df['year'].astype('int64'), df['month'].astype('int64')
+    df['_sort'] = df['gid_3'].map(contract_natural_key)
+    return df.sort_values(['_sort', 'name_3', 'year', 'month']).reindex(columns=CONTRACT_COLUMNS[kind]).reset_index(drop=True)
+
+
+def contract_metric_state(row, kind, source_count=None):
+    metrics = CONTRACT_DAY_METRICS if kind == 'day' else CONTRACT_NIGHT_METRICS
+    vals = row.reindex(metrics)
+    if source_count == 0:
+        return ('no_source', '') if vals.isna().all() else ('failed', 'Nguồn rỗng nhưng CSV có chỉ số')
+    if vals.isna().all():
+        return 'pending', 'Chưa có chỉ số; chưa có bằng chứng nguồn rỗng'
+    required = [c for c in metrics if c != 'TNL_MOM_GROWTH_PCT']
+    if vals[required].isna().any():
+        return 'failed', 'Chỉ số thiếu: ' + ','.join(vals[required].index[vals[required].isna()])
+    numeric = [c for c in required if c != 'TIME']
+    if not np.isfinite(pd.to_numeric(vals[numeric]).to_numpy(dtype=float)).all():
+        return 'failed', 'Chỉ số không hữu hạn'
+    if kind == 'night' and str(vals['TIME']) != f"{CONTRACT_YEAR}-{int(row['month']):02d}":
+        return 'failed', 'TIME không khớp year/month'
+    # pct_change: NaN first month, or infinite for a zero preceding TNL, are genuine outcomes.
+    return 'done', ''
+
+
+def contract_same_table(a, b):
+    """Compare CSV content without repeatedly migrating pandas dtype differences."""
+    try:
+        pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True),
+                                      check_dtype=False, check_exact=True)
+        return True
+    except AssertionError:
+        return False
+
+
+def contract_metric_states(frame, kind, sources):
+    """Validate an entire national CSV without one pandas lookup per commune-month."""
+    metrics = CONTRACT_DAY_METRICS if kind == 'day' else CONTRACT_NIGHT_METRICS
+    values = frame[metrics]
+    empty = values.isna().all(axis=1)
+    required = [c for c in metrics if c != 'TNL_MOM_GROWTH_PCT']
+    numeric = [c for c in required if c != 'TIME']
+    missing = values[required].isna().any(axis=1)
+    finite = pd.Series(np.isfinite(values[numeric].to_numpy(dtype=float)).all(axis=1), index=frame.index)
+    state = pd.Series('done', index=frame.index)
+    error = pd.Series('', index=frame.index)
+    state.loc[missing | ~finite] = 'failed'
+    error.loc[missing | ~finite] = 'Chỉ số thiếu hoặc không hữu hạn'
+    state.loc[empty] = 'pending'
+    error.loc[empty] = 'Chưa có chỉ số; chưa có bằng chứng nguồn rỗng'
+    if kind == 'night':
+        expected_time = frame['month'].map(lambda m: f'{CONTRACT_YEAR}-{int(m):02d}')
+        wrong_time = ~frame['TIME'].eq(expected_time) & ~empty
+        state.loc[wrong_time] = 'failed'
+        error.loc[wrong_time] = 'TIME không khớp year/month'
+    source_zero = pd.Series([sources.get((g, int(m), kind + '_indices')) == 0
+                            for g, m in zip(frame['gid_3'], frame['month'])], index=frame.index)
+    state.loc[source_zero & empty] = 'no_source'
+    error.loc[source_zero & empty] = ''
+    state.loc[source_zero & ~empty] = 'failed'
+    error.loc[source_zero & ~empty] = 'Nguồn rỗng nhưng CSV có chỉ số'
+    return {(g, int(m)): (s, e) for g, m, s, e in zip(frame['gid_3'], frame['month'], state, error)}
+
+
+def contract_merge_valid(old, incoming, admin, kind, sources=None):
+    """Repair only invalid/missing records, retaining previously valid measurements."""
+    sources = sources or {}
+    prior = contract_normalize(old, admin, kind)
+    new = contract_normalize(incoming, admin, kind, complete=False).set_index(CONTRACT_KEY).sort_index()
+    statuses = contract_metric_states(prior, kind, sources)
+    prior = prior.set_index(CONTRACT_KEY).sort_index()
+    repair = [key for key in new.index if statuses[key[0], key[2]][0] not in CONTRACT_TERMINAL]
+    metrics = CONTRACT_DAY_METRICS if kind == 'day' else CONTRACT_NIGHT_METRICS
+    if repair:
+        prior.loc[repair, metrics] = new.loc[repair, metrics]
+    return contract_normalize(prior.reset_index(), admin, kind)
+
+
+def contract_validate_image(path, kind):
+    """Decode every data block; a readable header alone does not prove integrity."""
+    import rasterio
+    try:
+        with rasterio.open(path) as src:
+            count, scale = (10, 20) if kind == 'day' else (2, 500)
+            if src.count != count or src.crs is None or src.crs.to_epsg() != 4326:
+                raise ValueError('Số kênh hoặc CRS không đúng')
+            tr = src.transform
+            m_per_deg = 111319.49079327357
+            if tr.a <= 0 or tr.e >= 0 or tr.b or tr.d or any(
+                    abs(v * m_per_deg - scale) > scale * .01 for v in [tr.a, -tr.e]):
+                raise ValueError('Độ phân giải/lưới không đúng')
+            if kind == 'night' and set(src.dtypes) != {'float64'}:
+                raise ValueError('Ảnh đêm cần float64')
+            if kind == 'day' and any(not np.issubdtype(np.dtype(t), np.floating) for t in src.dtypes):
+                raise ValueError('Ảnh ngày cần dữ liệu float, 10 kênh')
+            for _, window in src.block_windows(1):
+                src.read(window=window)
+        return 'done', ''
+    except Exception as exc:
+        return 'failed', f'{type(exc).__name__}: {exc}'
+
+
+def contract_read_sources(path):
+    if not Path(path).is_file():
+        return {}
+    df = pd.read_csv(path, dtype={'gid_3': str})
+    if not set(CONTRACT_KEY + ['field', 'count']).issubset(df):
+        raise ValueError('source_counts.csv sai cấu trúc')
+    df['count'] = pd.to_numeric(df['count'], errors='raise').astype(float)
+    if not df['year'].eq(CONTRACT_YEAR).all() or not df['month'].isin(CONTRACT_MONTHS).all() or not df['field'].isin(CONTRACT_FIELDS).all():
+        raise ValueError('source_counts.csv sai năm/tháng/field')
+    if df['count'].isna().any() or not np.isfinite(df['count']).all() or (df['count'] < 0).any() or df['count'].mod(1).ne(0).any():
+        raise ValueError('source_counts.csv thiếu/sai số cảnh')
+    df = df.drop_duplicates()
+    if df.duplicated(CONTRACT_KEY + ['field']).any():
+        raise ValueError('source_counts.csv có bằng chứng số cảnh mâu thuẫn')
+    return {(r.gid_3, int(r.month), r.field): float(r.count) for r in df.itertuples()}
+
+
+def contract_progress(admin, frames, images, sources=None, previous=None):
+    sources = sources or {}
+    admin = contract_administrative_table(admin, expected=None)
+    checks = {k: contract_metric_states(contract_normalize(frames[k], admin, k), k, sources) for k in ['day', 'night']}
+    checkpoints = {}
+    if previous is not None and not previous.empty and set(CONTRACT_KEY).issubset(previous):
+        checkpoints = {tuple(r[k] for k in CONTRACT_KEY): r for r in previous.to_dict('records')}
+    result = []
+    for a in admin.to_dict('records'):
+        for month in CONTRACT_MONTHS:
+            row = {**a, 'year': CONTRACT_YEAR, 'month': month}
+            prior = checkpoints.get((a['gid_3'], CONTRACT_YEAR, month), {})
+            for kind in ['day', 'night']:
+                key = (a['gid_3'], month)
+                field = kind + '_image'
+                state, error = images.get((kind, *key), ('pending', 'Chưa có ảnh'))
+                if state == 'pending' and sources.get((*key, field)) == 0:
+                    state, error = 'no_source', ''
+                row[field], row[field + '_error'] = state, error
+                field = kind + '_indices'
+                state, error = checks[kind][key]
+                row[field], row[field + '_error'] = state, error
+            for field in CONTRACT_FIELDS:
+                if row[field] == 'pending' and prior.get(field) in {'running', 'failed'}:
+                    row[field] = 'failed'  # interrupted/unfinished work must be retried
+                    row[field + '_error'] = prior.get(field + '_error') or 'Lượt trước bị ngắt; cần chạy tiếp'
+            result.append(row)
+    df = pd.DataFrame(result)
+    df['_sort'] = df['gid_3'].map(contract_natural_key)
+    return df.sort_values(['_sort', 'name_3', 'year', 'month']).drop(columns='_sort').reset_index(drop=True)
+
+
+def contract_require_day_complete(table):
+    if table.empty or not set(CONTRACT_KEY + ['day_image', 'day_indices']).issubset(table):
+        raise RuntimeError('Chưa có kiểm kê phần ngày hợp lệ')
+    if table.duplicated(CONTRACT_KEY).any() or not table['year'].eq(CONTRACT_YEAR).all() or not table['month'].isin(CONTRACT_MONTHS).all():
+        raise RuntimeError('Kiểm kê trùng khóa hoặc sai năm/tháng')
+    if not table.groupby('gid_3')['month'].nunique().eq(12).all():
+        raise RuntimeError('Kiểm kê phần ngày thiếu tháng')
+    blocked = ~table[['day_image', 'day_indices']].isin(CONTRACT_TERMINAL).all(axis=1)
+    if blocked.any():
+        raise RuntimeError(f'Chặn phần đêm: {int(blocked.sum())} xã–tháng ngày còn thiếu/lỗi')
+
+from types import SimpleNamespace
+D = SimpleNamespace(
+    YEAR=CONTRACT_YEAR,
+    MONTHS=CONTRACT_MONTHS,
+    EXPECTED_COMMUNES=CONTRACT_EXPECTED_COMMUNES,
+    ADMIN_COLUMNS=CONTRACT_ADMIN_COLUMNS,
+    KEY=CONTRACT_KEY,
+    PREFIX=CONTRACT_PREFIX,
+    DAY_BANDS=CONTRACT_DAY_BANDS,
+    DAY_METRICS=CONTRACT_DAY_METRICS,
+    NIGHT_METRICS=CONTRACT_NIGHT_METRICS,
+    COLUMNS=CONTRACT_COLUMNS,
+    FIELDS=CONTRACT_FIELDS,
+    TERMINAL=CONTRACT_TERMINAL,
+    STATES=CONTRACT_STATES,
+    IMAGE_RE=CONTRACT_IMAGE_RE,
+    VALIDATION_VERSION=CONTRACT_VALIDATION_VERSION,
+    natural_key=contract_natural_key,
+    administrative_table=contract_administrative_table,
+    aliases=contract_aliases,
+    normalize=contract_normalize,
+    metric_state=contract_metric_state,
+    same_table=contract_same_table,
+    metric_states=contract_metric_states,
+    merge_valid=contract_merge_valid,
+    validate_image=contract_validate_image,
+    read_sources=contract_read_sources,
+    progress=contract_progress,
+    require_day_complete=contract_require_day_complete,
+)
+
+"""Shared request pacing and bounded retries; never log signed URLs or response bodies."""
+import logging
+import random
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+log = logging.getLogger('vngis')
+
+
+def retry_after(value, now=None):
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (ValueError, TypeError):
+        try:
+            date = parsedate_to_datetime(str(value))
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0.0, (date - (now or datetime.now(timezone.utc))).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+
+def status_code(exc):
+    response = getattr(exc, 'response', None)
+    code = getattr(response, 'status_code', None) or getattr(exc, 'status_code', None)
+    if code is None:
+        code = getattr(getattr(exc, 'resp', None), 'status', None)
+    if code is not None:
+        return int(code)
+    # EEException often wraps its HTTP error as text, without a response attribute.
+    import re
+    match = re.search(r'\b(429|500|502|503|504|401|403)\b', str(exc))
+    if match:
+        return int(match[1])
+    if 'too many requests' in str(exc).lower():
+        return 429
+    return None
+
+
+def retry_delay(attempt, header=None):
+    explicit = retry_after(header)
+    if explicit is not None:
+        return explicit
+    base = min(120.0, 5.0 * 2 ** attempt)
+    return min(120.0, base + random.uniform(0, base * .25))
+
+
+class RequestGate:
+    """One concurrency budget for EE computations and image HTTP downloads.
+
+    Service clocks pace request starts; a 429 pauses all workers using this gate.
+    No semaphore is held while waiting for pacing, backoff or cooldown.
+    """
+    def __init__(self, concurrency, qps, check_stop, stop_event, clock=time.monotonic):
+        if concurrency < 1 or qps <= 0:
+            raise ValueError('Concurrency và QPS phải > 0')
+        self.semaphore = threading.BoundedSemaphore(concurrency)
+        self.qps = qps
+        self.check_stop = check_stop
+        self.stop_event = stop_event
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.next_start = {}
+        self.cooldown = 0.0
+        self.throttles = {}
+
+    def wait(self, seconds, allow_stopped=False):
+        if allow_stopped:
+            time.sleep(seconds)
+        else:
+            self.check_stop()
+            if self.stop_event.wait(seconds):
+                self.check_stop()
+
+    def defer(self, service, seconds, throttled=False):
+        with self.lock:
+            self.cooldown = max(self.cooldown, self.clock() + seconds)
+            if throttled:
+                self.throttles[service] = self.throttles.get(service, 0) + 1
+                count = self.throttles[service]
+            else:
+                count = None
+        if throttled:
+            log.warning('%s: HTTP 429 #%s; cooldown chung %.1fs', service, count, seconds)
+
+    @contextmanager
+    def slot(self, service, allow_stopped=False):
+        bucket = 'Drive' if service == 'Google Drive' else 'EE'
+        while True:
+            if not allow_stopped:
+                self.check_stop()
+            with self.lock:
+                delay = max(self.cooldown, self.next_start.get(bucket, 0)) - self.clock()
+            if delay > 0:
+                self.wait(min(delay, 1), allow_stopped)
+                continue
+            if not self.semaphore.acquire(timeout=.1):
+                continue
+            with self.lock:
+                now = self.clock()
+                ready = max(self.cooldown, self.next_start.get(bucket, 0)) <= now
+                if ready:
+                    self.next_start[bucket] = now + 1.0 / self.qps
+            if ready:
+                break
+            self.semaphore.release()
+        try:
+            yield
+        finally:
+            self.semaphore.release()
+
+    def call(self, service, operation, attempts=6):
+        for attempt in range(attempts):
+            try:
+                with self.slot(service):
+                    return operation()
+            except Exception as exc:
+                code = status_code(exc)
+                if code not in {429, 500, 502, 503, 504}:
+                    raise
+                if attempt == attempts - 1:
+                    if code == 429:
+                        self.defer(service, 0, True)
+                    # Omit exception text: it can contain authenticated URLs.
+                    raise RuntimeError(f'{service}: HTTP {code or "error"}; '
+                                       f'{attempt + 1}/{attempts} lần thử') from None
+                headers = getattr(getattr(exc, 'response', None), 'headers', {}) or getattr(exc, 'resp', {}) or {}
+                delay = retry_delay(attempt, headers.get('Retry-After', headers.get('retry-after')))
+                self.defer(service, delay, code == 429)
 
 def _env(name, default, cast=str):
     raw = os.environ.get(name)
@@ -859,7 +1289,6 @@ if any(float(RCLONE_COMMON[i]) <= 0 for i in (1, 3, 5, 7)):
 
 
 def _rclone(args, timeout=1200, quiet=False):
-    from v6_runtime import rclone_run
     return rclone_run(args, timeout=timeout, allow_stopped=True).returncode == 0
 
 
@@ -949,12 +1378,637 @@ def load_targets(admin):
 # =====================================================================================
 def main():
     import argparse
-    from v6_runtime import main as run
     parser = argparse.ArgumentParser()
     parser.add_argument("step", nargs="?", choices=["run", "inventory"], default="run")
     parser.add_argument("--sync-only", action="store_true")
     args = parser.parse_args()
-    return run(sys.modules[__name__], step=args.step, sync_only=args.sync_only)
+    return pipeline_main(sys.modules[__name__], step=args.step, sync_only=args.sync_only)
+
+
+
+# Điều phối ngày → đêm, kiểm kê và chạy tiếp.
+"""Inventory and scheduling around the v6 scientific routines.
+
+Only successfully verified/uploaded artifacts become done. JSONL is a checkpoint,
+not proof of an artifact's existence. No national run executes on import.
+"""
+import glob
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+V = sys.modules[__name__]
+
+log = logging.getLogger('vngis')
+_drive_lock = threading.Lock()
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def safe_error(exc):
+    # HTTP libraries can include a signed download URL in exception messages.
+    text = re.sub(r'https?://\S+', '[URL omitted]', str(exc))
+    text = re.sub(r'(?i)(token|signature|key|authorization)\s*[=:]\s*\S+', r'\1=[omitted]', text)
+    return f'{type(exc).__name__}: {text[:300]}'
+
+
+def rclone_run(args, timeout=1200, allow_stopped=False):
+    """All Drive commands share pacing/serialization and bounded application retries."""
+    common = V.RCLONE_COMMON
+    for attempt in range(V.REQUEST_ATTEMPTS):
+        with V.REQUEST_GATE.slot('Google Drive', allow_stopped), _drive_lock:
+            result = subprocess.run(['rclone', *args, *common], capture_output=True,
+                                    text=True, timeout=timeout)
+        throttled = bool(re.search(r'\b429\b|rateLimitExceeded|userRateLimitExceeded', result.stderr, re.I))
+        if result.returncode == 0:
+            if throttled:
+                V.REQUEST_GATE.defer('Google Drive', 0, True)
+            return result
+        transient = throttled or bool(re.search(r'\b(500|502|503|504)\b', result.stderr))
+        if not transient or attempt == V.REQUEST_ATTEMPTS - 1:
+            if throttled:
+                V.REQUEST_GATE.defer('Google Drive', 0, True)
+                log.error('Google Drive: hết %s lần thử vì giới hạn request', V.REQUEST_ATTEMPTS)
+            return result
+        header = re.search(r'(?im)^\s*Retry-After:\s*([^\r\n]+)', result.stderr)
+        V.REQUEST_GATE.defer('Google Drive', retry_delay(attempt, header[1] if header else None), throttled)
+    raise RuntimeError('Không có lượt rclone')
+
+
+class Drive:
+    def __init__(self, base=None, local=None):
+        self.base = base or V.REMOTE_BASE
+        self.local = Path(local or V.LOCAL_ROOT)
+        self.backup_stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
+
+    def command(self, args, optional=False, allow_stopped=False):
+        result = rclone_run(args, allow_stopped=allow_stopped)
+        if result.returncode:
+            if optional and re.search(r'directory not found|object not found|file not found', result.stderr, re.I):
+                return None
+            raise RuntimeError(f'Google Drive: {args[0]} thất bại (mã {result.returncode}); '
+                               'kiểm tra quyền, kết nối hoặc quota')
+        return result.stdout
+
+    def fetch(self, rel, dest, optional=False):
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        text = self.command(['copyto', f'{self.base}/{rel}', str(dest)], optional)
+        return dest if text is not None else None
+
+    def listing(self, rel):
+        raw = self.command(['lsjson', f'{self.base}/{rel}', '-R', '--files-only', '--hash'], optional=True)
+        return json.loads(raw) if raw is not None else []
+
+    def stat(self, rel, allow_stopped=False):
+        raw = self.command(['lsjson', f'{self.base}/{rel}', '--stat', '--hash'], optional=True,
+                           allow_stopped=allow_stopped)
+        return json.loads(raw) if raw is not None else None
+
+    def _put(self, path, rel, backup=True):
+        # This is also the final flush after STOP; new scientific work stays stopped.
+        if backup and self.stat(rel, allow_stopped=True) is not None:
+            backup_id = self.backup_stamp + '_' + uuid.uuid4().hex[:8]
+            self.command(['copyto', f'{self.base}/{rel}',
+                          f'{self.base}/_control/backups/{backup_id}/{rel}'], allow_stopped=True)
+        temporary = f'{self.base}/_control/staging/{uuid.uuid4().hex}.part'
+        self.command(['copyto', str(path), temporary], allow_stopped=True)
+        self.command(['moveto', temporary, f'{self.base}/{rel}'], allow_stopped=True)
+
+    def put(self, path, rel, backup=True):
+        # Keep an immutable local outbox so --sync-only can retry a failed final upload.
+        outbox = self.local/'_control/outbox'/uuid.uuid4().hex
+        outbox.mkdir(parents=True, exist_ok=True)
+        payload = outbox/'payload'
+        path = Path(path)
+        if path.suffix in {'.csv', '.tif', '.json'}:
+            # These writers replace files atomically; a hard link preserves the old inode.
+            try:
+                os.link(path, payload)
+            except OSError:
+                shutil.copyfile(path, payload)
+        else:
+            shutil.copyfile(path, payload)
+        (outbox/'manifest.json').write_text(json.dumps(dict(base=self.base, rel=rel, backup=backup)))
+        self._put(payload, rel, backup)
+        shutil.rmtree(outbox)
+
+    def flush_outbox(self):
+        for path in sorted((self.local/'_control/outbox').glob('*/manifest.json'), key=lambda p: p.stat().st_mtime_ns):
+            job = json.loads(path.read_text())
+            if job['base'] != self.base:
+                raise ValueError('Outbox thuộc thư mục Drive khác; không tự đổi đích upload')
+            self._put(path.parent/'payload', job['rel'], job['backup'])
+            shutil.rmtree(path.parent)
+
+    def pull_history(self):
+        for sub in ['_control/status', '_control/parts']:
+            log.info('KIỂM KÊ: đọc lịch sử %s', sub)
+            for entry in self.listing(sub):
+                if entry['Path'].endswith('.jsonl'):
+                    self.fetch(f"{sub}/{entry['Path']}", self.local/sub/entry['Path'])
+
+
+def fingerprint(entry):
+    return dict(size=entry.get('Size'), mtime=entry.get('ModTime'),
+                hashes=entry.get('Hashes', {}), version=D.VALIDATION_VERSION)
+
+
+def read_jsonl(path):
+    lines = Path(path).read_text(encoding='utf-8').splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1 and not line.endswith('\n'):
+                log.warning('Bỏ dòng cuối JSONL chưa ghi xong: %s', Path(path).name)
+            else:
+                raise ValueError(f'JSONL hỏng: {Path(path).name}, dòng {index + 1}') from None
+
+
+class Engine:
+    def __init__(self, admin, drive=None):
+        self.admin = D.administrative_table(admin, expected=None)
+        self.drive = drive or Drive()
+        self.root = self.drive.local
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.sync_lock = threading.Lock()
+        self.contexts = {r['gid_3']: V.build_ctx({k.upper(): v for k, v in r.items()})
+                         for r in self.admin.to_dict('records')}
+        self.mapping = {c['safe_gid3']: g for g, c in self.contexts.items()}
+        self.sources = {}
+        self.cache = {}
+        self.images = {}
+        self.frames = {}
+        self.table = None
+        self.positions = {}
+        self.history = {}
+        self.dirty = set()
+        self.last_sync = time.monotonic()
+        self.run = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '_' + V.RUN_ID + '_' + uuid.uuid4().hex[:8]
+
+    def save_cache(self, cache):
+        path = self.root/'_control/validated_images.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix('.json.part')
+        temporary.write_text(json.dumps(cache), encoding='utf-8')
+        temporary.replace(path)
+        self.drive.put(path, '_control/validated_images.json', backup=False)
+
+    def scan_images(self):
+        old = self.cache.copy()
+        current = {}
+        self.images = {}
+        new_checks, reused, dirty = 0, 0, False
+        last_save = time.monotonic()
+        every = max(1, int(os.getenv('VNGIS_INVENTORY_CHECKPOINT_EVERY', '250')))
+        seen = set()
+        try:
+            for kind in ['day', 'night']:
+                log.info('KIỂM KÊ %s: đang liệt kê Drive', kind)
+                listing = self.drive.listing(kind.title())
+                log.info('KIỂM KÊ %s: %s file, bắt đầu đối chiếu', kind, len(listing))
+                for i, entry in enumerate(listing, 1):
+                    match = D.IMAGE_RE.match(Path(entry['Path']).name)
+                    if not match or match[2] != kind or match[1] not in self.mapping:
+                        continue
+                    V.check_stop()
+                    key = (kind, self.mapping[match[1]], int(match[3]))
+                    rel = f"{kind.title()}/{entry['Path']}"
+                    if key in seen:
+                        self.images[key] = 'failed', 'Có nhiều file cùng xã/tháng'
+                        continue
+                    seen.add(key)
+                    fp = fingerprint(entry)
+                    previous = old.get(rel, {})
+                    if previous.get('fingerprint') == fp and previous.get('state') in {'done', 'failed'}:
+                        state, error = previous['state'], previous.get('error', '')
+                        reused += 1
+                    else:
+                        log.info('KIỂM KÊ %s %s/%s: tải %s (%.1f MB)', kind, i, len(listing), rel,
+                                 entry.get('Size', 0)/1e6)
+                        size = entry.get('Size', 0)
+                        if shutil.disk_usage(self.root).free < size + 512 * 1024 ** 2:
+                            raise RuntimeError('Không đủ dung lượng kiểm tra ảnh; cache đã hoàn tất sẽ được giữ')
+                        start = time.monotonic()
+                        path = self.root/'_control/validation'/Path(rel).name
+                        self.drive.fetch(rel, path)
+                        try:
+                            log.info('KIỂM KÊ: đã tải, đang đọc mọi block GeoTIFF')
+                            state, error = D.validate_image(path, kind)
+                        finally:
+                            path.unlink(missing_ok=True)
+                        new_checks += 1
+                        dirty = True
+                        log.info('KIỂM KÊ: %s trong %.1fs; mới %s, dùng cache %s',
+                                 state, time.monotonic()-start, new_checks, reused)
+                    current[rel] = dict(fingerprint=fp, state=state, error=error)
+                    self.images[key] = state, error
+                    if dirty and (new_checks % every == 0 or time.monotonic()-last_save >= 120):
+                        self.save_cache({**old, **current})
+                        dirty, last_save = False, time.monotonic()
+                    elif reused and reused % every == 0:
+                        log.info('KIỂM KÊ: đã tái sử dụng %s kết quả kiểm tra', reused)
+            self.save_cache(current)
+            self.cache = current
+            dirty = False
+        finally:
+            if dirty:
+                self.cache = {**old, **current}
+                try:
+                    self.save_cache(self.cache)
+                except Exception as exc:
+                    log.error('Không lưu được cache giữa chừng: %s', safe_error(exc))
+
+    def inventory(self):
+        log.info('KIỂM KÊ: đọc tiến độ, nguồn và cache cũ')
+        previous = self.drive.fetch('_control/progress.csv', self.root/'_control/progress.csv', True)
+        prior = pd.read_csv(previous) if previous else None
+        source = self.drive.fetch('_control/source_counts.csv', self.root/'_control/source_counts.csv', True)
+        self.sources = D.read_sources(source) if source else {}
+        if set(g for g, _, _ in self.sources) - set(self.contexts):
+            raise ValueError('Bằng chứng nguồn chứa GID ngoài phạm vi thư mục')
+        cache = self.drive.fetch('_control/validated_images.json', self.root/'_control/validated_images.json', True)
+        self.cache = json.loads(cache.read_text()) if cache else {}
+        self.drive.pull_history()
+        for path in sorted((self.root/'_control/status').glob('status_*.jsonl')):
+            for record in read_jsonl(path):
+                if 'gid_3' in record:
+                    self.history[record['gid_3']] = record
+                    for item in record.get('source_counts', []):
+                        self.sources[record['gid_3'], int(item['month']), item['field']] = item['count']
+        self.scan_images()
+        for kind in ['day', 'night']:
+            log.info('KIỂM KÊ: đọc CSV %s và parts v6', kind)
+            rel = f'CSV/{kind}_indices.csv'
+            path = self.drive.fetch(rel, self.root/rel, True)
+            original = pd.read_csv(path) if path else pd.DataFrame()
+            frame = D.normalize(original, self.admin, kind)
+            parts = [r for p in sorted((self.root/'_control/parts').glob(f'{kind}_*.jsonl')) for r in read_jsonl(p)]
+            if parts:
+                # Ignore measurements already backed by a valid CSV, preserving them exactly.
+                states = D.metric_states(frame, kind, self.sources)
+                rows = D.aliases(pd.DataFrame(parts))
+                selected = [states.get((str(r.gid_3), int(r.month)), ('pending', ''))[0] not in D.TERMINAL
+                            for r in rows.itertuples()]
+                frame = D.merge_valid(frame, rows.loc[selected], self.admin, kind, self.sources)
+            self.frames[kind] = frame
+            if path is None or not D.same_table(frame, original):
+                self.dirty.add(kind)
+        self.table = D.progress(self.admin, self.frames, self.images, self.sources, prior)
+        self.table['updated_at'] = stamp()
+        self.positions = {(r.gid_3, int(r.month)): i for i, r in enumerate(self.table.itertuples())}
+        self.checkpoint(force=True)
+        for field in D.FIELDS:
+            log.info('KIỂM KÊ %s: %s', field, self.table[field].value_counts().to_dict())
+        return self.table
+
+    def checkpoint(self, force=False):
+        if not force and time.monotonic()-self.last_sync < V.UPLOAD_EVERY_SEC:
+            return
+        with self.sync_lock, self.lock:
+            if not force and time.monotonic()-self.last_sync < V.UPLOAD_EVERY_SEC:
+                return
+            for kind in sorted(self.dirty):
+                rel = f'CSV/{kind}_indices.csv'
+                path = self.root/rel
+                V._write_csv(self.frames[kind], str(path))
+                self.drive.put(path, rel, backup=True)
+            self.dirty.clear()
+            sources = pd.DataFrame([dict(gid_3=g, year=D.YEAR, month=m, field=f, count=n)
+                                    for (g, m, f), n in sorted(self.sources.items())],
+                                   columns=D.KEY+['field', 'count'])
+            for rel, frame in [('_control/source_counts.csv', sources), ('_control/progress.csv', self.table)]:
+                V._write_csv(frame, str(self.root/rel))
+                self.drive.put(self.root/rel, rel, backup=False)
+            self.save_cache(self.cache)
+            for sub in ['status', 'parts']:
+                for path in (self.root/'_control'/sub).glob(f'*_{self.run}.jsonl'):
+                    self.drive.put(path, f'_control/{sub}/{path.name}', backup=False)
+            self.last_sync = time.monotonic()
+            log.info('CHECKPOINT: đã lưu CSV, nguồn, cache và tiến độ xã–tháng lên Drive')
+
+    def update(self, gid, month, field, state, error=''):
+        with self.lock:
+            i = self.positions[gid, month]
+            self.table.loc[i, [field, field+'_error', 'updated_at']] = [state, error, stamp()]
+            self.write_status(gid, month)
+
+    def write_status(self, gid, month=None, include_sources=False):
+        rows = self.table.iloc[[self.positions[gid, m] for m in D.MONTHS]]
+        info = dict(gid_3=gid, run_id=V.RUN_ID, version='v6-resume',
+                    phase_attempts=self.history.get(gid, {}).get('phase_attempts', {}),
+                    status='done' if rows[D.FIELDS].isin(D.TERMINAL).all().all() else 'partial',
+                    finished_at=stamp())
+        if month is not None:
+            info['month_status'] = self.table.iloc[self.positions[gid, month]].to_dict()
+        if include_sources:
+            info['source_counts'] = [dict(month=m, field=f, count=self.sources[gid,m,f])
+                                    for m in D.MONTHS for f in D.FIELDS if (gid,m,f) in self.sources]
+        self.history[gid] = {**self.history.get(gid, {}), **info}
+        path = self.root/f'_control/status/status_{self.run}.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(info, ensure_ascii=False)+'\n')
+
+    def needed(self, gid, field):
+        with self.lock:
+            rows = self.table.iloc[[self.positions[gid, m] for m in D.MONTHS]]
+            return list(rows.loc[~rows[field].isin(D.TERMINAL), 'month'].astype(int))
+
+    def add_metrics(self, gid, kind, incoming, months):
+        normalized = D.normalize(incoming, self.admin.loc[self.admin.gid_3.eq(gid)], kind)
+        with self.lock:
+            for month in months:
+                row = normalized.loc[normalized.month.eq(month)].iloc[0]
+                field = kind+'_indices'
+                count = self.sources.get((gid, month, field))
+                state, error = D.metric_state(row, kind, count)
+                if state == 'pending' and count and count > 0:
+                    state, error = 'failed', 'Có nguồn nhưng phép tính không trả chỉ số tháng này'
+                i = self.positions[gid, month]
+                if state in D.TERMINAL and self.table.loc[i, field] not in D.TERMINAL:
+                    metrics = D.DAY_METRICS if kind == 'day' else D.NIGHT_METRICS
+                    self.frames[kind].loc[i, metrics] = row[metrics].to_numpy()
+                    self.dirty.add(kind)
+                    path = self.root/f'_control/parts/{kind}_{self.run}.jsonl'
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with path.open('a', encoding='utf-8') as fh:
+                        fh.write(row.to_json(force_ascii=False)+'\n')
+                self.update(gid, month, field, state, error)
+
+    def check_asset(self, full_admin):
+        gids = V.ee_getinfo(V.communes_fc.aggregate_array('GID_3'))
+        expected = set(D.administrative_table(full_admin).gid_3)
+        actual = set(gids)
+        missing, extra = expected-actual, actual-expected
+        if missing or extra or len(gids) != len(actual):
+            message = f'Asset không khớp GADM: thiếu {len(missing)}, ngoài phạm vi {len(extra)}, trùng {len(gids)-len(actual)}; thiếu mẫu {sorted(missing)[:10]}'
+            for gid in missing & set(self.contexts):
+                for month in D.MONTHS:
+                    self.update(gid, month, 'day_image', 'failed', message)
+            self.checkpoint(force=True)
+            raise ValueError(message)
+
+    def process(self, gid, kind):
+        V.check_stop()
+        if kind == 'night':
+            D.require_day_complete(self.table)
+        ctx = self.contexts[gid].copy()
+        fc = V.communes_fc.filter(V.ee.Filter.eq('GID_3', gid))
+        geom = fc.geometry()
+        ctx['geom'] = geom
+        missing = {field: self.needed(gid, kind+'_'+field) for field in ['image', 'indices']}
+        if not any(missing.values()):
+            return
+        for suffix, months in missing.items():
+            for month in months:
+                self.update(gid, month, kind+'_'+suffix, 'running')
+        try:
+            n, plan = V.fetch_plan(fc, geom, kind)
+            if n != 1:
+                raise ValueError(f'Asset phải có đúng một feature cho GID {gid}; có {n}')
+            with self.lock:
+                for month, entry in plan.items():
+                    for suffix in ['image', 'indices']:
+                        field = kind+'_'+suffix
+                        count = entry[suffix+'_count']
+                        self.sources[gid, month, field] = count
+                        if month in missing[suffix] and count == 0:
+                            if suffix == 'indices':
+                                i = self.positions[gid, month]
+                                state, error = D.metric_state(self.frames[kind].iloc[i], kind, 0)
+                                self.update(gid, month, field, state, error)
+                            else:
+                                image_state = self.images.get((kind, gid, month))
+                                if image_state and image_state[0] == 'failed':
+                                    self.update(gid, month, field, 'failed', 'Nguồn rỗng nhưng file ảnh hiện có hỏng/trùng')
+                                else:
+                                    self.update(gid, month, field, 'no_source')
+                self.write_status(gid, include_sources=True)
+            months = self.needed(gid, kind+'_indices')
+            sourced = [m for m in months if plan[m]['indices_count'] > 0]
+            if sourced:
+                try:
+                    if kind == 'day':
+                        props = V.task1_all_months(fc, months=sourced)
+                        incoming = pd.DataFrame([{**r, 'YEAR': D.YEAR} for r in props])
+                    else:
+                        # All sourced months are needed to preserve v6 rolling/pct_change semantics.
+                        incoming = V.task3_all_months(geom, ctx['gid1'], ctx['name1'], gid, ctx['cname_full'])
+                    self.add_metrics(gid, kind, incoming, sourced)
+                    self.checkpoint()
+                except Exception as exc:
+                    for month in sourced:
+                        self.update(gid, month, kind+'_indices', 'failed', safe_error(exc))
+            jobs = self.needed(gid, kind+'_image')
+            with ThreadPoolExecutor(max_workers=V.MONTH_THREADS) as pool:
+                futures = {pool.submit(self.process_image, gid, kind, m, ctx, plan[m]): m for m in jobs}
+                for future in as_completed(futures):
+                    month = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        self.update(gid, month, kind+'_image', 'failed', safe_error(exc))
+        except Exception as exc:
+            for suffix in ['image', 'indices']:
+                for month in self.needed(gid, kind+'_'+suffix):
+                    self.update(gid, month, kind+'_'+suffix, 'failed', safe_error(exc))
+        finally:
+            self.checkpoint()
+
+    def process_image(self, gid, kind, month, ctx, entry):
+        V.check_stop()
+        if entry['image_count'] == 0:
+            return
+        rel = str(Path(ctx['rel_'+kind+'_dir'])/(V.day_name(ctx, month) if kind == 'day' else V.night_name(ctx, month)))
+        image = (V.day_image(month, entry['s2_window'], ctx['geom']).select(V.DAY_BANDS_ALL)
+                 if kind == 'day' else V.night_image(month, entry['viirs'], ctx['geom']))
+        path = self.root/'_control/candidates'/Path(rel).name
+        min_free = V._env('VNGIS_MIN_FREE_GB', 6.0, float) * 1024 ** 3
+        if shutil.disk_usage(self.root).free < min_free:
+            raise RuntimeError('Dung lượng đĩa dưới ngưỡng VNGIS_MIN_FREE_GB; không bắt đầu tải ảnh mới')
+        V.download_tif(image, ctx['geom'], 20 if kind == 'day' else 500, str(path), f'[{gid}] {kind}/{month}')
+        state, error = D.validate_image(path, kind)
+        if state != 'done':
+            raise ValueError(error)
+        self.drive.put(path, rel, backup=True)
+        stat = self.drive.stat(rel, allow_stopped=True)
+        if stat is None:
+            raise RuntimeError('File vừa upload không tồn tại trên Drive')
+        with self.lock:
+            self.cache[rel] = dict(fingerprint=fingerprint(stat), state='done', error='')
+            self.images[kind, gid, month] = 'done', ''
+            self.update(gid, month, kind+'_image', 'done')
+        path.unlink()
+        self.checkpoint()
+
+    def preflight(self, kind):
+        if kind == 'night':
+            D.require_day_complete(self.table)
+        gid = next((g for g in self.contexts if self.needed(g, kind+'_image') or self.needed(g, kind+'_indices')), None)
+        if gid is None:
+            return
+        fc = V.communes_fc.filter(V.ee.Filter.eq('GID_3', gid))
+        geom = fc.geometry()
+        _, plan = V.fetch_plan(fc, geom, kind)
+        month = next((m for m in D.MONTHS if plan[m]['image_count'] > 0), None)
+        if month is None:
+            log.info('PREFLIGHT %s: không có nguồn tại xã mẫu; worker sẽ xác minh no_source', kind)
+            return
+        region = geom.centroid(maxError=1).buffer(1500)
+        image = (V.day_image(month, plan[month]['s2_window'], geom).select(V.DAY_BANDS_ALL)
+                 if kind == 'day' else V.night_image(month, plan[month]['viirs'], geom)).clip(region)
+        scale = 20 if kind == 'day' else 500
+        whole = V.fetch_geotiff_bytes(image, region, scale)
+        import rasterio
+        with rasterio.MemoryFile(whole) as memory, memory.open() as source:
+            if source.count != (10 if kind == 'day' else 2) or source.crs.to_epsg() != 4326:
+                raise ValueError('PREFLIGHT: số kênh/CRS sai')
+            array, transform = source.read(), source.transform
+        if V.PREFLIGHT_TILE_TEST:
+            V.TILING_OK[0] = False
+            parts = [V.fetch_geotiff_bytes(image, rect, scale) for rect in V._split_bbox(V._bbox(region), 2)]
+            tiled, tiled_transform, *_ = V.mosaic_tiles(parts)
+            V.compare_on_grid(array, transform, tiled, tiled_transform)
+            V.TILING_OK[0] = True
+        log.info('PREFLIGHT %s: đạt; không truy vấn ảnh của giai đoạn khác', kind)
+
+    def run_phase(self, kind):
+        if kind == 'night':
+            D.require_day_complete(self.table)
+        fields = [kind+'_image', kind+'_indices']
+        if self.table[fields].isin(D.TERMINAL).all().all():
+            return True
+        exhausted = [g for g in self.contexts if any(self.needed(g, f) for f in fields)
+                     and self.history.get(g, {}).get('phase_attempts', {}).get(kind, 0) >= V.MAX_ATTEMPTS]
+        if len(exhausted) == sum(any(self.needed(g, f) for f in fields) for g in self.contexts):
+            log.error('Giai đoạn %s đã hết số lần thử; không gửi preflight/request mới', kind)
+            return False
+        if V.PREFLIGHT:
+            self.preflight(kind)
+        while True:
+            V.check_stop()
+            jobs = []
+            for gid in self.contexts:
+                if not any(self.needed(gid, f) for f in fields):
+                    continue
+                attempts = self.history.get(gid, {}).get('phase_attempts', {}).get(kind, 0)
+                if attempts < V.MAX_ATTEMPTS:
+                    jobs.append(gid)
+            if not jobs:
+                break
+            log.info('GIAI ĐOẠN %s: còn %s xã cần xử lý', kind, len(jobs))
+            with ThreadPoolExecutor(max_workers=V.N_WORKERS) as pool:
+                futures = {}
+                def attempt_process(gid):
+                    V.check_stop()
+                    with self.lock:
+                        previous = self.history.setdefault(gid, {})
+                        counts = previous.setdefault('phase_attempts', {})
+                        counts[kind] = counts.get(kind, 0)+1
+                        self.write_status(gid)
+                    self.process(gid, kind)
+                for gid in jobs:
+                    futures[pool.submit(attempt_process, gid)] = gid
+                for future in as_completed(futures):
+                    future.result()
+            self.checkpoint(force=True)
+        complete = self.table[fields].isin(D.TERMINAL).all().all()
+        if not complete:
+            log.error('Giai đoạn %s còn thiếu/lỗi sau giới hạn thử; dừng nối lượt tự động', kind)
+        return bool(complete)
+
+
+def pipeline_main(module, step='run', sync_only=False):
+    global V
+    V = module
+    V.setup_logging()
+    V.install_signal_handlers()
+    timer = None
+    engine = None
+    watcher = None
+    watcher_stop = threading.Event()
+    code = 1
+    if V.MAX_RUNTIME_SEC > 0:
+        timer = threading.Timer(V.MAX_RUNTIME_SEC, V.request_stop, args=('deadline',))
+        timer.daemon = True
+        timer.start()
+    try:
+        if sync_only:
+            Drive().flush_outbox()
+            log.info('sync-only: đã gửi nốt outbox, không ghi đè bằng CSV cũ ngoài outbox')
+            return 0
+        admin = V.build_admin_table()
+        targets = V.load_targets(admin)
+        engine = Engine(targets)
+        engine.drive.flush_outbox()
+        if engine.drive.stat('_control/STOP') is not None:
+            return 130
+        def watch_stop():
+            while not watcher_stop.wait(V.DRIVE_STOP_POLL_SEC):
+                try:
+                    if engine.drive.stat('_control/STOP') is not None:
+                        V.request_stop('drive_stop')
+                        return
+                except V.StopRequested:
+                    return
+                except Exception as exc:
+                    log.warning('Không kiểm tra được STOP trên Drive: %s', safe_error(exc))
+        watcher = threading.Thread(target=watch_stop, daemon=True, name='drive-stop')
+        watcher.start()
+        engine.inventory()
+        if step == 'inventory':
+            return 0
+        V.init_earth_engine()
+        engine.check_asset(admin)
+        if V._env('VNGIS_RETRY_FAILED', False, bool):
+            for gid in engine.contexts:
+                engine.history.setdefault(gid, {}).setdefault('phase_attempts', {}).pop('day', None)
+        V.TILING_OK[0] = False  # Only successful preflight verifies the tiling grid.
+        if not engine.run_phase('day'):
+            return 1
+        # Read actual uploaded files and CSVs again before admitting the night phase.
+        engine.inventory()
+        D.require_day_complete(engine.table)
+        if V._env('VNGIS_RETRY_FAILED', False, bool):
+            for gid in engine.contexts:
+                engine.history.setdefault(gid, {}).setdefault('phase_attempts', {}).pop('night', None)
+        V.TILING_OK[0] = False
+        code = 0 if engine.run_phase('night') else 1
+        return code
+    except V.StopRequested:
+        return {'deadline': 3, 'fatal': 1}.get(V.STOP_REASON[0], 130)
+    except Exception as exc:
+        log.error('LỖI: %s', safe_error(exc))
+        return 1
+    finally:
+        watcher_stop.set()
+        if watcher:
+            watcher.join(timeout=5)
+        if timer:
+            timer.cancel()
+        if engine is not None and engine.table is not None:
+            try:
+                engine.checkpoint(force=True)
+                for path in (engine.root/'_control/logs').glob('*.log'):
+                    engine.drive.put(path, f'_control/logs/{path.name}', backup=False)
+            except Exception as exc:
+                log.error('Không lưu được checkpoint cuối lượt: %s', safe_error(exc))
+                return 1
 
 
 if __name__ == "__main__" and os.environ.get("VNGIS_SKIP_MAIN") != "1":
