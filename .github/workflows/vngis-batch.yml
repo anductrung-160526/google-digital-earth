@@ -1,0 +1,144 @@
+name: VNGISDash 2024 batch (cắt ảnh export theo xã)
+
+# Xử lý kết quả batch export do Colab gửi lên Earth Engine (xem HUONG_DAN_BATCH.md).
+# step:
+#   inventory  kiểm kê Drive -> _control/progress.csv
+#   day        CSV ngày + cắt ảnh ngày + kiểm kê   (chạy trước)
+#   night      CSV đêm + cắt ảnh đêm + kiểm kê     (chạy sau khi phần ngày xong)
+#   day-csv | day-img | night-csv | night-img      chạy riêng từng phần
+# Mỗi lượt tối đa ~5 giờ 15 phút rồi tự nối lượt cho tới khi xong.
+# Dừng chuỗi: tạo file STOP_BATCH ở thư mục gốc repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "Phần cần chạy"
+        type: choice
+        options: [day, night, inventory, day-csv, day-img, night-csv, night-img]
+        default: day
+      compare:
+        description: "Số xã đã có ảnh cũ dùng để so sánh từng pixel (0 = không so sánh)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: vngis-batch
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  VNGIS_MODE: full
+  VNGIS_DRIVE_FOLDER: VNGISDash_2024
+  VNGIS_RCLONE_REMOTE: gdrive
+
+jobs:
+  run:
+    name: ${{ inputs.step }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      VNGIS_MAX_RUNTIME_SEC: "18900"
+      VNGIS_UPLOAD_EVERY_SEC: "60"
+      VNGIS_MIN_FREE_GB: "6"
+      VNGIS_RCLONE_TRANSFERS: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kiểm tra file STOP_BATCH
+        id: gate
+        run: |
+          if [ -f STOP_BATCH ]; then echo "stop=true" >> "$GITHUB_OUTPUT"; echo "::notice::Có STOP_BATCH: không chạy."; fi
+
+      - name: Dọn ổ máy chạy
+        if: steps.gate.outputs.stop != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.stop != 'true'
+        id: py
+        with:
+          python-version: "3.11"
+
+      - name: Cache thư viện Python và rclone
+        if: steps.gate.outputs.stop != 'true'
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/venv
+            ~/bin/rclone
+          key: deps-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-rclone1
+
+      - name: Cài thư viện và rclone
+        if: steps.gate.outputs.stop != 'true' && steps.deps.outputs.cache-hit != 'true'
+        run: |
+          python -m venv ~/venv
+          ~/venv/bin/pip install -q -r requirements.txt
+          mkdir -p ~/bin && cd /tmp
+          curl -fsSL -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
+          unzip -q rclone.zip && cp rclone-*-linux-amd64/rclone ~/bin/ && chmod +x ~/bin/rclone
+
+      - name: Đưa venv và rclone vào PATH
+        if: steps.gate.outputs.stop != 'true'
+        run: |
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Cache ranh giới GADM
+        if: steps.gate.outputs.stop != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/vngis_2024/_cache
+          key: gadm41-vnm-v1
+
+      - name: Ghi khóa truy cập từ Secrets
+        if: steps.gate.outputs.stop != 'true'
+        env:
+          RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
+          EE_KEY_DATA: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          [ -n "$RCLONE_CONF_DATA" ] || { echo "::error::Thiếu secret RCLONE_CONF"; exit 1; }
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$RCLONE_CONF_DATA" > "$HOME/.config/rclone/rclone.conf"
+          printf '%s' "$EE_KEY_DATA" > "$RUNNER_TEMP/ee-key.json"
+          chmod 600 "$HOME/.config/rclone/rclone.conf" "$RUNNER_TEMP/ee-key.json"
+
+      - name: Chạy
+        if: steps.gate.outputs.stop != 'true'
+        id: main
+        env:
+          VNGIS_EE_KEY_FILE: ${{ runner.temp }}/ee-key.json
+          VNGIS_RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          python -u process_exports.py "${{ inputs.step }}" --compare "${{ inputs.compare }}"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Mã thoát $code"
+          exit 0
+
+      - name: Nối lượt kế tiếp
+        if: steps.main.outputs.code == '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/STOP_BATCH" > /dev/null 2>&1; then
+            echo "::notice::Có STOP_BATCH: không nối lượt."
+          else
+            gh workflow run vngis-batch.yml --ref "$GITHUB_REF_NAME" -f step="${{ inputs.step }}" -f compare=0
+            echo "Đã gọi lượt kế tiếp."
+          fi
+
+      - name: Báo lỗi
+        if: steps.main.outputs.code == '1'
+        run: |
+          echo "::error::Có lỗi. Mở bước 'Chạy', tìm dòng LỖI hoặc ERROR."
+          exit 1
