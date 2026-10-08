@@ -6,21 +6,31 @@ Mỗi xã cho ra:
 
 | Task | Kết quả |
 |---|---|
-| 1 | 1 CSV 12 tháng: trung bình và độ lệch chuẩn của 10 kênh (20 cột) |
-| 2 | 12 ảnh GeoTIFF Sentinel-2, 10 kênh, 20 m |
+| 1 | 12 dòng trong `CSV/day_indices.csv`: trung bình và độ lệch chuẩn của 10 kênh (20 cột) |
+| 2 | 12 ảnh GeoTIFF Sentinel-2, 10 kênh, 20 m, giữ nguyên giá trị Earth Engine (như bản 4) |
 | 3.1 | 12 ảnh GeoTIFF VIIRS, 2 kênh `avg_rad`, `cf_cvg`, 500 m |
-| 3.2 | 1 CSV chỉ số ánh sáng đêm theo tháng |
+| 3.2 | 12 dòng trong `CSV/night_indices.csv`: chỉ số ánh sáng đêm theo tháng |
+
+**Dung lượng ảnh ngày.** Mặc định giống bản 4: 10 kênh, kiểu số thực, nén DEFLATE không mất dữ liệu, mở được bằng QGIS, ArcGIS, GDAL, rasterio. Ba biến trong file workflow (phần `env` của job `run`) đổi dung lượng:
+
+| Biến | Giá trị | Tác động |
+|---|---|---|
+| `VNGIS_DAY_FORMAT` | `float` (mặc định) / `int16` | `int16` nhỏ hơn khoảng 3 đến 4 lần, sai số tối đa 0,00005, nhưng nhiều trình xem ảnh thông thường không mở được |
+| `VNGIS_DAY_BANDS` | `10` (mặc định) / `6` | `6` bỏ NDVI, NDBI, MNDWI, BSI (tính lại được), nhỏ hơn khoảng 40% |
+| `VNGIS_DAY_SCALE` | `10000` (mặc định) / `1000` | Chỉ có tác dụng khi `int16`; `1000` nhỏ thêm khoảng 40%, sai số 0,0005 |
+
+Dung lượng còn tỷ lệ thuận với diện tích xã. Hai tham số khoa học cũng quyết định dung lượng nhưng **không nên đổi** vì sẽ khác notebook: `scale` 20 m khi tải ảnh ngày (tăng lên 40 m thì file nhỏ khoảng 4 lần) và 500 m khi tải ảnh đêm.
 
 ## 0. Cần chuẩn bị
 
-- **Dung lượng Drive.** Ảnh Sentinel-2 20 m, 10 kênh, cho cả nước 12 tháng là rất lớn. Ước tính thô của tôi là khoảng 0,5 đến 1,5 TB sau khi nén. Con số thật lấy từ báo cáo thí điểm (mục "Dung lượng và thời gian"): lấy số MB trung bình mỗi xã nhân khoảng 11.000. Drive giới hạn tải lên khoảng 750 GB mỗi ngày.
+- **Dung lượng Drive.** Ảnh ngày giữ nguyên như bản 4 nên khá lớn: ước tính thô vài trăm GB đến hơn 1 TB cho cả nước với mặc định. Con số thật lấy từ báo cáo thí điểm (dòng "dung lượng ... KB/ảnh"): lấy KB trung bình × 12 tháng × khoảng 11.000 xã.
 - **Repo nên để Public** để runner GitHub miễn phí không giới hạn phút. Khóa truy cập nằm trong Secrets nên không lộ. Bạn nên đọc lại điều khoản GitHub Actions trước khi chạy dài ngày.
 - Quyền quản trị project Google Cloud `digital-vietnam-earth`.
 
 ## 1. Dọn bản cũ (bắt buộc)
 
 1. Tab **Actions**: nếu còn lượt nào đang chạy, mở lượt đó và bấm **Cancel workflow**.
-2. Trên Google Drive: **xóa thư mục `VNGISDash_Communes_2024`** của bản cũ (chứa ảnh rỗng và bản ghi trạng thái cũ).
+2. Trên Google Drive: **xóa các thư mục cũ** `VNGISDash_Communes_2024` và `VNGISDash_PILOT_2024` (cấu trúc cũ). Bản mới ghi vào `VNGISDash_2024` và `VNGISDash_2024_PILOT`.
 3. Trong repo: xóa các file cũ (`vngis_2024.py`, `HUONG_DAN_GITHUB_ACTIONS.md`, `requirements.txt`, `.github/workflows/vngis-2024.yml`) rồi đưa bộ file mới lên ở bước 2.
 
 ## 2. Đưa file lên repo
@@ -70,13 +80,13 @@ Repo ▸ **Settings ▸ Secrets and variables ▸ Actions ▸ New repository sec
 
 Thêm: **Settings ▸ Actions ▸ General ▸ Workflow permissions ▸ Read and write permissions** (để lượt này gọi được lượt sau).
 
-## 6. Chạy thí điểm 2 xã
+## 6. Chạy thí điểm
 
 Không cần chọn tỉnh, xã. Ở chế độ `pilot`, pipeline tự lấy số xã bạn nhập ở ô `pilot_n` (mặc định 2), theo thứ tự mã GADM, xen kẽ phường (đô thị) và xã (nông thôn). Ví dụ `pilot_n` = 5 cho 3 phường và 2 xã. Mã các xã được in ở dòng `Danh sách: ... (thí điểm: ...)` trong log.
 
 **Chạy.** Tab **Actions ▸ VNGISDash 2024 (chạy nối lượt) ▸ Run workflow**: `mode` = `pilot`, `pilot_n` = số xã muốn thử (ví dụ `2`), `workers` = `2` (nếu thử nhiều xã có thể tăng lên `4` đến `8`).
 
-Kết quả ghi vào thư mục riêng **`VNGISDash_PILOT_2024`**, không đụng tới dữ liệu thật.
+Kết quả ghi vào thư mục riêng **`VNGISDash_2024_PILOT`**, không đụng tới dữ liệu thật. Ở chế độ thí điểm mọi xã chạy cùng lúc, mỗi xã tải 24 ảnh song song. Phần xử lý 2 xã dự kiến khoảng 1 đến 2 phút; cả job thêm khoảng 1 phút khởi động (lượt đầu cài thư viện lâu hơn, các lượt sau dùng cache).
 
 **Đọc preflight (trong 2 đến 5 phút đầu).** Mở lượt chạy ▸ job **Chạy một lượt** ▸ bước **Chạy pipeline**, tìm các dòng `[preflight]`:
 
@@ -89,13 +99,13 @@ Kết quả ghi vào thư mục riêng **`VNGISDash_PILOT_2024`**, không đụn
 
 Nếu preflight lỗi, script dừng ngay với mã 1 (không chạy tiếp để tạo file rỗng như lần trước). Gửi tôi nguyên dòng lỗi.
 
-**Đọc báo cáo kiểm tra.** Khi lượt thí điểm xong, bước **Kiểm tra kết quả thí điểm** tự chạy `verify_pilot.py`. Báo cáo nằm ở trang **Summary** của lượt chạy và trong file `VNGISDash_PILOT_2024/_control/verify_report.md` trên Drive. Mỗi xã có bảng PASS/WARN/FAIL:
+**Đọc báo cáo kiểm tra.** Khi lượt thí điểm xong, bước **Kiểm tra kết quả thí điểm** tự chạy `verify_pilot.py`. Báo cáo nằm ở trang **Summary** của lượt chạy và trong file `VNGISDash_2024_PILOT/_control/verify_report.md` trên Drive. Mỗi xã có bảng PASS/WARN/FAIL:
 
 - Trạng thái xã là `done`.
-- Task 2: đủ số ảnh (12 trừ tháng không có ảnh kể cả khi nới biên ±30 ngày), mỗi ảnh 10 kênh, 20 m, EPSG:4326.
-- Task 3.1: đủ ảnh đêm, 2 kênh, 500 m, Float64.
-- Task 1, Task 3.2: số dòng và số cột đúng như notebook.
-- Dung lượng và thời gian của từng xã, dùng để ước tính cho cả nước.
+- Ảnh ngày: đủ số ảnh (12 trừ tháng không có ảnh kể cả khi nới biên ±30 ngày), đủ kênh, 20 m, kèm dung lượng KB mỗi ảnh.
+- Ảnh đêm: đủ ảnh, 2 kênh, 500 m, Float64.
+- `CSV/day_indices.csv`, `CSV/night_indices.csv`: xã có đủ dòng, đủ cột như notebook.
+- Thời gian xử lý từng xã.
 
 WARN "toàn NoData" ở một vài tháng là bình thường với tháng mây phủ kín. Có bất kỳ dòng FAIL nào thì chưa chạy toàn quốc.
 
@@ -103,15 +113,15 @@ WARN "toàn NoData" ở một vài tháng là bình thường với tháng mây 
 
 ```python
 !pip -q install rasterio
-!python verify_pilot.py --root /content/drive/MyDrive/VNGISDash_PILOT_2024 \
+!python verify_pilot.py --root /content/drive/MyDrive/VNGISDash_2024_PILOT \
     --notebook-dir /content/nb_out --notebook-gid VNM.4.1.10_1 --gids VNM.4.1.10_1
 ```
 
-Các dòng "Đối chiếu ..." phải PASS: CSV lệch tối đa 1e-6, ảnh trùng từng pixel.
+Các dòng "Đối chiếu ..." phải PASS: CSV lệch tối đa 1e-6; ảnh trùng từng pixel (nếu chuyển sang int16 thì ảnh ngày lệch tối đa 0,00005).
 
 ## 7. Chạy toàn quốc
 
-Sau khi thí điểm PASS: **Run workflow** với `mode` = `full`, `workers` = `8`. Kết quả ghi vào **`VNGISDash_Communes_2024`**.
+Sau khi thí điểm PASS: **Run workflow** với `mode` = `full`, `workers` = `8`. Kết quả ghi vào **`VNGISDash_2024`**.
 
 Theo dõi:
 
@@ -119,7 +129,7 @@ Theo dõi:
 - Drive: `_control/progress.csv` (một dòng mỗi xã) và `_control/logs/`.
 - GitHub gửi email khi một lượt thất bại.
 
-Khi xong toàn bộ, lượt cuối ghi `HOÀN TẤT` và tạo các file gộp trong `_merged/`.
+Hai file `CSV/day_indices.csv` và `CSV/night_indices.csv` được dựng lại ở cuối mỗi lượt, nên luôn chứa mọi xã đã xong tính tới lượt gần nhất. Khi xong toàn bộ, lượt cuối ghi `HOÀN TẤT`.
 
 ## 8. Dừng và tiếp tục
 
@@ -134,28 +144,28 @@ Luôn dùng **Run workflow**. Nút **Re-run all jobs** chạy lại với input 
 ## 9. Cấu trúc thư mục trên Drive
 
 ```
-VNGISDash_Communes_2024/              (thí điểm: VNGISDash_PILOT_2024/, cùng cấu trúc)
-├── _control/
-│   ├── status/status_<thời điểm>_<run_id>.jsonl   trạng thái từng xã, mỗi lượt một file
-│   ├── logs/run_<thời điểm>_<run_id>.log
-│   ├── progress.csv                               tổng hợp trạng thái mọi xã
-│   ├── verify_report.md                           (chỉ khi thí điểm)
-│   └── STOP                                       (tự tạo khi muốn dừng)
-├── 1_Task1_Spectral_Indices/<GID_1>_<tỉnh>/
-│       s2_<tỉnh>_<GID_1>_<GID_3>_2024_Spectral_Indices.csv
-├── 2_Task2_Day_S2/<GID_1>_<tỉnh>/S2_Day_<tỉnh>_<xã>_<GID_3>_202401-202412/
-│       S2_Day_<tỉnh>_<xã>_<GID_3>_2024MM.tif       (12 file)
-├── 3_Task3_Night_VIIRS/<GID_1>_<tỉnh>/VIIRS_Night_<tỉnh>_<xã>_<GID_3>_202401-202412/
-│       VIIRS_Night_<tỉnh>_<xã>_<GID_3>_2024MM.tif  (12 file)
-├── 4_Task3_Economic_Indices/<GID_1>_<tỉnh>/
-│       VIIRS_Night_<tỉnh>_<xã>_<GID_3>_202401-202412_Economic_Indices.csv
-└── _merged/                                        (tạo khi xong toàn bộ)
-    ├── Task1_Spectral_Indices_2024_ALL.csv
-    ├── Task3_Economic_Indices_2024_ALL.csv
-    └── by_province/<tên>_<GID_1>.csv
+VNGISDash_2024/                                  cấp 1   (thí điểm: VNGISDash_2024_PILOT/)
+├── Day/                                         cấp 2
+│   └── VNM.4_1_bac_ninh/                        tỉnh: <GID_1>_<tên tỉnh>
+│       └── VNM.4.1.10_1_phuong_ve_an/           xã: <GID_3>_<tên xã>
+│           └── VNM_4_1_10_1_day_2024MM.tif      12 ảnh (10 kênh, 20 m)
+├── Night/                                       cấp 2
+│   └── VNM.4_1_bac_ninh/
+│       └── VNM.4.1.10_1_phuong_ve_an/
+│           └── VNM_4_1_10_1_night_2024MM.tif    12 ảnh (2 kênh, 500 m)
+├── CSV/                                         cấp 2
+│   ├── day_indices.csv                          chỉ số ngày, gộp toàn quốc
+│   └── night_indices.csv                        chỉ số đêm, gộp toàn quốc
+└── _control/                                    cấp 2: theo dõi và chạy tiếp
+    ├── progress.csv                             1 dòng/xã: trạng thái, tháng thiếu, lỗi
+    ├── verify_report.md                         chỉ có khi thí điểm
+    ├── status/                                  trạng thái nội bộ để lượt sau làm tiếp
+    ├── parts/                                   chỉ số từng lượt, dùng để dựng 2 file CSV
+    ├── logs/
+    └── STOP                                     bạn tự tạo khi muốn dừng
 ```
 
-Tên thư mục và tên file ảnh, CSV giữ đúng quy tắc đặt tên của notebook. Muốn gộp lại CSV bất kỳ lúc nào: chạy `python vngis_2024.py --merge-only` ở máy có rclone.
+Tháng nào không có ảnh, kể cả khi nới ±30 ngày, thì không có file tif tháng đó; `progress.csv` ghi số tháng thiếu.
 
 ## 10. Xử lý sự cố
 
@@ -166,8 +176,10 @@ Tên thư mục và tên file ảnh, CSV giữ đúng quy tắc đặt tên củ
 | `Asset không có xã ...` | GID_3 trong asset `communes_l3` không khớp GADM; gửi tôi mã xã |
 | `invalid_grant`, `token expired` (rclone) | Làm lại bước 4 và cập nhật `RCLONE_CONF` |
 | `24 lượt tải liên tiếp thất bại` | Script tự dừng với mã 1 để không tạo file rỗng. Gửi tôi dòng "Lỗi gần nhất" |
+| `429 Too Many Requests ... concurrency limit` | Project vượt hạn mức Earth Engine. Pipeline tự chờ, tự hạ số lệnh gọi cùng lúc và thử lại; xã lỗi vì 429 không bị tính lần thử. Muốn nhanh hơn thì nâng hạn mức project (liên kết billing account) rồi tăng `VNGIS_EE_CONCURRENCY` |
+| `No space left on device` | Ổ máy GitHub đầy vì ảnh tải nhanh hơn tốc độ đẩy lên Drive. Bản hiện tại đã xử lý: dọn ổ lúc khởi động, tạm dừng tải khi ổ còn dưới 4 GB (`VNGIS_MIN_FREE_GB`), đẩy lên Drive mỗi phút với 16 file song song, và đầu mỗi lượt đối chiếu ảnh trên Drive để làm lại tháng bị thiếu. Nếu vẫn gặp, giảm `workers` |
 | Log báo `vượt hạn mức tải, chia NxN ô` | Bình thường với xã lớn; ảnh được ghép lại đúng lưới pixel |
-| Log cảnh báo còn thư mục `03_Provinces`, `04_Status` | Thư mục Drive còn dữ liệu bản cũ: xóa theo mục 1 |
+| Log cảnh báo thư mục Drive còn dữ liệu của bản pipeline cũ | Xóa thư mục cũ theo mục 1 |
 | `Resource not accessible by integration` ở bước nối lượt | Bật Read and write permissions (cuối bước 5) |
 
 Mã thoát (dòng `Script thoát với mã N` trong log):
