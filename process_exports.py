@@ -146,7 +146,7 @@ def setup():
         os.makedirs(d, exist_ok=True)
     V.setup_logging()
     ADMIN = V.build_admin_table()
-    D.administrative_table(ADMIN)  # fail explicitly if scope is not exactly 11,136
+    D.administrative_table(ADMIN)  # require the full 11,163-unit GADM scope
     CTX.clear()
     SAFE2GID.clear()
     V.ADMIN_DF = ADMIN

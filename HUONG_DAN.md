@@ -4,4 +4,4 @@ Luồng hiện tại dùng batch export, hoàn tất ảnh và chỉ số ngày 
 
 Không xóa thư mục dữ liệu cũ khi nâng cấp. Workflow `vngis-2024.yml` cũng gọi luồng batch và không còn chạy ngày/đêm đồng thời. Các công thức khoa học vẫn nằm trong `vngis_2024.py`; bộ dữ liệu công khai dùng schema được định nghĩa tại `data_contract.py`.
 
-Phạm vi yêu cầu là đúng 11.136 mã xã và 12 tháng năm 2024. Cần đối chiếu bộ địa giới chuẩn với asset Earth Engine trước khi xử lý; số lượng chưa được xác minh bằng dữ liệu thật trong môi trường cloud chưa có credentials.
+Phạm vi đã chọn là toàn bộ **11.163 đơn vị cấp 3 của GADM 4.1 Việt Nam**, lấy dữ liệu 12 tháng năm 2024. Bảng GADM thật đã được kiểm tra có 11.163 GID_3 duy nhất, 63 tỉnh và không thiếu thông tin hành chính. Asset Earth Engine vẫn phải có đúng tập mã này; việc đối chiếu asset cần xác thực Google.

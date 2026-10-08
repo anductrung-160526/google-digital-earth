@@ -10,7 +10,8 @@ import pandas as pd
 
 YEAR = 2024
 MONTHS = range(1, 13)
-EXPECTED_COMMUNES = 11136
+# Full Vietnam level-3 scope in GADM 4.1, explicitly selected by the user.
+EXPECTED_COMMUNES = 11163
 ADMIN_COLUMNS = ['gid_3', 'name_3', 'type_3', 'gid_2', 'name_2', 'gid_1', 'name_1']
 KEY = ['gid_3', 'year', 'month']
 PREFIX = ADMIN_COLUMNS + ['year', 'month']
