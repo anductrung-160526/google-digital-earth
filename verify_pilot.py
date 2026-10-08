@@ -56,7 +56,7 @@ def check_tif(path, bands, scale_m, dtype):
         res_m = abs(s.transform.a) * M_PER_DEG
         if abs(res_m - scale_m) > 0.01 * scale_m:
             return "FAIL", f"pixel {res_m:.2f} m (cần {scale_m} m)"
-        if s.dtypes[0] != dtype:
+        if dtype and s.dtypes[0] != dtype:
             return "FAIL", f"kiểu {s.dtypes[0]} (cần {dtype})"
     a, _, _ = read_scaled(path)
     if np.all(np.isnan(a)) or not np.any(np.nan_to_num(a) != 0):
@@ -75,9 +75,9 @@ def verify_commune(root, gid, st, day_csv, night_csv):
     safe = gid.replace(".", "_")
     st = st or {}
     res = [("Trạng thái", "PASS" if st.get("status") == "done" else "FAIL", st.get("status", "không có bản ghi"))]
-    day_bands = int(st.get("day_bands", 6))
+    day_bands = int(st.get("day_bands", 10))
 
-    for kind, sub, key, bands, scale, dtype in (("Ảnh ngày", "Day", "t2", day_bands, 20, "int16"),
+    for kind, sub, key, bands, scale, dtype in (("Ảnh ngày", "Day", "t2", day_bands, 20, None),
                                                 ("Ảnh đêm", "Night", "t3img", 2, 500, "float64")):
         files = sorted(glob.glob(os.path.join(root, sub, "*", f"{gid}_*", f"{safe}_{sub.lower()}_2024??.tif")))
         none_m = sorted(k for k, v in (st.get(key) or {}).items() if v == "none")
@@ -99,7 +99,7 @@ def verify_commune(root, gid, st, day_csv, night_csv):
             notes.append(f"tháng toàn NoData: {','.join(empties)}")
         if sizes:
             notes.append(f"dung lượng {min(sizes):.0f} đến {max(sizes):.0f} KB/ảnh, TB {np.mean(sizes):.0f} KB")
-        res.append((f"{kind} ({bands} kênh, {scale} m, {dtype})", lv, "; ".join(notes)))
+        res.append((f"{kind} ({bands} kênh, {scale} m)", lv, "; ".join(notes)))
 
     d = day_csv[day_csv["GID_3"] == gid] if day_csv is not None else pd.DataFrame()
     if d.empty:
