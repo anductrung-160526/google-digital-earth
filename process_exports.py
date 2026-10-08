@@ -20,17 +20,24 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+os.environ.setdefault('VNGIS_MODE', 'full')
+os.environ.setdefault('VNGIS_DRIVE_FOLDER', 'VNGISDash_2024')
 import vngis_2024 as V
 import batch_config as B
+import data_contract as D
+from pathlib import Path
 
 log = V.log
 EXP = f"{V.RCLONE_REMOTE}:{B.EXPORT_FOLDER}"
-WORK = os.path.expanduser("~/vngis_batch")
+WORK = os.environ.get("VNGIS_BATCH_WORK", os.path.expanduser("~/vngis_batch"))
 WAIT_POLL_SEC = 300
 STABLE_SEC = 900              # nếu không đọc được trạng thái tác vụ: file export phải "đứng yên" 15 phút mới xử lý
 COMPARE_N = 0
 
 ADMIN = None
+PROGRESS = None
+SOURCES = {}
+IMAGE_CACHE = {}
 CTX = {}                      # GID_3 -> ctx (đường dẫn, tên file)
 SAFE2GID = {}
 
@@ -57,12 +64,69 @@ def fetch(remote_file, local_path):
 
 
 def fetch_optional(remote_file, local_path):
+    # Permission/network failures must never masquerade as a missing optional file.
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    if os.path.isfile(local_path):
+        os.remove(local_path)
     res = subprocess.run(["rclone", "copyto", remote_file, local_path], capture_output=True, text=True, timeout=3600)
-    return local_path if res.returncode == 0 and os.path.isfile(local_path) else None
+    if res.returncode:
+        if "directory not found" in res.stderr or "object not found" in res.stderr:
+            return None
+        raise RuntimeError(f"Không đọc được {remote_file}: {res.stderr.strip()[-300:]}")
+    return local_path if os.path.isfile(local_path) else None
 
 
-def free_gb(path=WORK):
+def upload_atomic(path, rel, backup=True):
+    """Stage and verify upload before replacing a target; retain the previous file."""
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
+    target = f"{V.REMOTE_BASE}/{rel}"
+    if backup:
+        existing = fetch_optional(target, os.path.join(WORK, 'backup', rel))
+        if existing:
+            dest = f"{V.REMOTE_BASE}/_control/backups/{stamp}/{rel}"
+            if not V._rclone(['copyto', existing, dest]):
+                raise RuntimeError(f'Không sao lưu được {rel}; giữ nguyên bản cũ')
+    staged = target + f'.{stamp}.part'
+    if not V._rclone(['copyto', path, staged]) or not V._rclone(['moveto', staged, target]):
+        raise RuntimeError(f'Không ghi nguyên tử được {rel}; giữ file tạm để kiểm tra')
+
+
+def checkpoint(field, gids, month, state, error=''):
+    global PROGRESS
+    if PROGRESS is None:
+        return
+    selected = PROGRESS['gid_3'].isin(gids)
+    if month is not None:
+        selected &= PROGRESS['month'].eq(month)
+    # Do not downgrade evidence of valid output or confirmed no-source.
+    selected &= ~PROGRESS[field].isin(D.TERMINAL)
+    PROGRESS.loc[selected, field] = state
+    PROGRESS.loc[selected, field + '_error'] = error
+    path = V.L(V.D_CONTROL, 'progress.csv')
+    V._write_csv(PROGRESS, path)
+    upload_atomic(path, '_control/progress.csv', backup=False)
+
+
+def flush_logs():
+    for handler in log.handlers:
+        handler.flush()
+    folder = Path(V.L(V.D_LOGS))
+    if folder.is_dir():
+        for path in folder.glob('*.log'):
+            upload_atomic(str(path), f'_control/logs/{path.name}', backup=False)
+
+
+def save_sources():
+    rows = [dict(gid_3=g, year=V.YEAR, month=m, field=f, count=c)
+            for (g, m, f), c in SOURCES.items()]
+    path = V.L(V.D_CONTROL, 'source_counts.csv')
+    V._write_csv(pd.DataFrame(rows, columns=D.KEY + ['field', 'count']), path)
+    upload_atomic(path, '_control/source_counts.csv')
+
+
+def free_gb(path=None):
     import shutil
+    path = path or WORK
     os.makedirs(path, exist_ok=True)
     return shutil.disk_usage(path).free / 1e9
 
@@ -76,10 +140,15 @@ def summary(md):
 
 def setup():
     global ADMIN
+    if V.DRIVE_FOLDER != 'VNGISDash_2024':
+        raise RuntimeError('Batch yêu cầu VNGIS_DRIVE_FOLDER=VNGISDash_2024; không ghi vào thư mục khác')
     for d in (V.LOCAL_ROOT, V.L(V.D_CONTROL), V.L(V.D_LOGS), V.CACHE_DIR, WORK):
         os.makedirs(d, exist_ok=True)
     V.setup_logging()
     ADMIN = V.build_admin_table()
+    D.administrative_table(ADMIN)  # fail explicitly if scope is not exactly 11,136
+    CTX.clear()
+    SAFE2GID.clear()
     V.ADMIN_DF = ADMIN
     V.ADMIN_BY_GID = {r["GID_3"]: r for r in ADMIN.to_dict("records")}
     for r in ADMIN.to_dict("records"):
@@ -92,7 +161,7 @@ def setup():
 def load_plan():
     p = fetch_optional(f"{EXP}/{B.PLAN_DAY}", os.path.join(WORK, B.PLAN_DAY))
     if not p:
-        raise RuntimeError(f"Chưa có {B.PLAN_DAY} trong {EXP}. Chạy cx.compute_day_plan() trong Colab trước.")
+        raise FileNotFoundError(f"Chưa có {B.PLAN_DAY} trong {EXP}. Chạy cx.compute_day_plan() trong Colab trước.")
     with open(p, encoding="utf-8") as f:
         return json.load(f)
 
@@ -104,112 +173,134 @@ _TIF_RE = re.compile(r"^(.+)_(day|night)_2024(\d\d)\.tif$")
 
 
 def list_existing():
-    """Tập (GID_3, tháng) đã có ảnh trên Drive, cho Day và Night."""
-    have = {"day": {}, "night": {}}
-    for kind, d in (("day", V.D_DAY), ("night", V.D_NIGHT)):
-        res = subprocess.run(["rclone", "lsf", "-R", "--files-only", "--fast-list", "--include", "*.tif",
-                              f"{V.REMOTE_BASE}/{d}"], capture_output=True, text=True, timeout=3600)
-        if res.returncode != 0 and "directory not found" not in res.stderr:
-            raise RuntimeError(f"Không liệt kê được {d}: {res.stderr.strip()[-300:]}")
-        for line in res.stdout.splitlines():
-            m = _TIF_RE.match(os.path.basename(line.strip()))
-            if m and m.group(2) == kind and m.group(1) in SAFE2GID:
-                have[kind].setdefault(SAFE2GID[m.group(1)], set()).add(int(m.group(3)))
-    log.info(f"Trên Drive: ảnh ngày {sum(map(len, have['day'].values())):,} file ({len(have['day']):,} xã), "
-             f"ảnh đêm {sum(map(len, have['night'].values())):,} file ({len(have['night']):,} xã)")
+    """Validate actual Drive files; reuse only unchanged, previously decoded images."""
+    global IMAGE_CACHE
+    path = fetch_optional(f'{V.REMOTE_BASE}/_control/validated_images.json',
+                          os.path.join(WORK, 'validated_images.json'))
+    cache = json.loads(Path(path).read_text(encoding='utf-8')) if path else {}
+    have = {'day': {}, 'night': {}}
+    IMAGE_CACHE = {}
+    next_cache = {}
+    seen = set()
+    for kind in ['day', 'night']:
+        listing = rclone_json(f'{V.REMOTE_BASE}/{kind.title()}', '-R', '--hash', '--include', '*.tif')
+        for f in listing:
+            match = D.IMAGE_RE.match(os.path.basename(f['Path']))
+            if not match or match[2] != kind or match[1] not in SAFE2GID:
+                continue
+            V.check_stop()
+            gid, month = SAFE2GID[match[1]], int(match[3])
+            key = kind, gid, month
+            relative = f"{kind.title()}/{f['Path']}"
+            fingerprint = {'size': f.get('Size'), 'mtime': f.get('ModTime'),
+                           'hashes': f.get('Hashes', {}), 'version': D.VALIDATION_VERSION}
+            if key in seen:
+                IMAGE_CACHE[key] = 'failed', 'Có nhiều file cùng xã/tháng'
+                have[kind].get(gid, set()).discard(month)
+                continue
+            seen.add(key)
+            previous = cache.get(relative, {})
+            if previous.get('fingerprint') == fingerprint and previous.get('state') == 'done':
+                state, error = 'done', ''
+            else:
+                local = os.path.join(WORK, 'validate', os.path.basename(f['Path']))
+                _wait_space(f.get('Size', 0))
+                fetch(f'{V.REMOTE_BASE}/{relative}', local)
+                state, error = D.validate_image(local, kind)
+                os.remove(local)
+            IMAGE_CACHE[key] = state, error
+            next_cache[relative] = dict(fingerprint=fingerprint, state=state, error=error)
+            if state == 'done':
+                have[kind].setdefault(gid, set()).add(month)
+    local = V.L(V.D_CONTROL, 'validated_images.json')
+    with open(local + '.part', 'w', encoding='utf-8') as fh:
+        json.dump(next_cache, fh)
+    os.replace(local + '.part', local)
+    upload_atomic(local, '_control/validated_images.json', backup=False)
     return have
 
 
-def csv_months(rel):
-    p = fetch_optional(f"{V.REMOTE_BASE}/{rel}", os.path.join(WORK, "inv", os.path.basename(rel)))
-    if not p:
-        return {}
-    df = pd.read_csv(p, usecols=["GID_3", "MONTH"], dtype={"GID_3": str})
-    return df.groupby("GID_3")["MONTH"].nunique().to_dict()
+def read_national(kind):
+    rel = f'CSV/{kind}_indices.csv'
+    path = fetch_optional(f'{V.REMOTE_BASE}/{rel}', os.path.join(WORK, 'national', kind + '.csv'))
+    return pd.read_csv(path) if path else pd.DataFrame(columns=D.COLUMNS[kind])
 
 
 def inventory():
-    have = list_existing()
-    day_csv, night_csv = csv_months(V.DAY_CSV), csv_months(V.NIGHT_CSV)
+    global PROGRESS, SOURCES
+    previous = fetch_optional(f'{V.REMOTE_BASE}/_control/progress.csv', os.path.join(WORK, 'previous.csv'))
+    prior = pd.read_csv(previous) if previous else None
+    source = fetch_optional(f'{V.REMOTE_BASE}/_control/source_counts.csv', os.path.join(WORK, 'sources.csv'))
+    SOURCES = D.read_sources(source) if source else {}
     try:
         plan = load_plan()
-    except Exception:
+    except FileNotFoundError:
         plan = {}
-    rows = []
-    for r in ADMIN.itertuples():
-        g = r.GID_3
-        exp_day = ([m for m in V.MONTHS if B.window_class(plan[g][m - 1]) is not None] if g in plan else V.MONTHS)
-        hd, hn = have["day"].get(g, set()), have["night"].get(g, set())
-        miss_d = [m for m in exp_day if m not in hd]
-        miss_n = [m for m in V.MONTHS if m not in hn]
-        dc, nc = int(day_csv.get(g, 0)), int(night_csv.get(g, 0))
-        rows.append({"GID_1": r.GID_1, "NAME_1": r.NAME_1, "GID_3": g, "NAME_3": r.NAME_3,
-                     "day_tif": len(hd), "day_tif_expected": len(exp_day),
-                     "day_tif_missing": ",".join(f"{m:02d}" for m in miss_d), "day_csv_months": dc,
-                     "night_tif": len(hn), "night_tif_missing": ",".join(f"{m:02d}" for m in miss_n),
-                     "night_csv_months": nc,
-                     "day_status": "done" if not miss_d and dc > 0 else ("partial" if hd or dc else "missing"),
-                     "night_status": "done" if not miss_n and nc > 0 else ("partial" if hn or nc else "missing")})
-    df = pd.DataFrame(rows)
-    path = V.L(V.D_CONTROL, "progress.csv")
-    V._write_csv(df, path)
-    V._rclone(["copyto", path, f"{V.REMOTE_BASE}/{V.D_CONTROL}/progress.csv"])
-    dv, nv = df["day_status"].value_counts().to_dict(), df["night_status"].value_counts().to_dict()
-    log.info(f"KIỂM KÊ: ngày {dv} | đêm {nv} | đã ghi _control/progress.csv")
-    summary(f"### Kiểm kê {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC\n\n"
-            f"| | done | partial | missing |\n|---|---|---|---|\n"
-            f"| Ngày | {dv.get('done', 0):,} | {dv.get('partial', 0):,} | {dv.get('missing', 0):,} |\n"
-            f"| Đêm | {nv.get('done', 0):,} | {nv.get('partial', 0):,} | {nv.get('missing', 0):,} |\n\n"
-            f"Ảnh ngày: {df['day_tif'].sum():,}/{df['day_tif_expected'].sum():,} file. "
-            f"Ảnh đêm: {df['night_tif'].sum():,}/{12 * len(df):,} file. "
-            f"CSV ngày: {(df['day_csv_months'] > 0).sum():,} xã. CSV đêm: {(df['night_csv_months'] > 0).sum():,} xã.\n")
-    return df
+    SOURCES.update(D.plan_sources(plan))
+    if SOURCES != (D.read_sources(source) if source else {}):
+        save_sources()
+    list_existing()
+    frames = {kind: read_national(kind) for kind in ['day', 'night']}
+    for kind, frame in frames.items():
+        normalized = D.normalize(frame, ADMIN, kind)
+        # Migration changes presentation only, never recomputes valid scientific values.
+        if not frame.empty and not D.same_table(normalized, frame):
+            path = V.L('CSV', kind + '_indices.csv')
+            V._write_csv(normalized, path)
+            upload_atomic(path, 'CSV/' + kind + '_indices.csv')
+        frames[kind] = normalized
+    PROGRESS = D.progress(ADMIN, frames, IMAGE_CACHE, SOURCES, prior)
+    path = V.L(V.D_CONTROL, 'progress.csv')
+    V._write_csv(PROGRESS, path)
+    upload_atomic(path, '_control/progress.csv', backup=False)
+    for field in D.FIELDS:
+        counts = PROGRESS[field].value_counts().to_dict()
+        log.info(f'KIỂM KÊ {field}: {counts}')
+        summary(f'- {field}: {counts}')
+    return PROGRESS
 
 
 # ------------------------------------------------------------------------------------
 # 2. CSV
 # ------------------------------------------------------------------------------------
 def _download_csvs(prefix):
+    refresh_task_states()
     files = [f for f in rclone_json(EXP, "--include", f"{prefix}*.csv")]
     out = []
     for f in files:
+        description = os.path.splitext(os.path.basename(f['Path']))[0]
+        if not export_ready(description, {0: f}):
+            continue
         out.append(fetch(f"{EXP}/{f['Path']}", os.path.join(WORK, "csv", f["Path"])))
     return out
 
 
-def _merge_national(df_new, rel, cols):
-    old = fetch_optional(f"{V.REMOTE_BASE}/{rel}", os.path.join(WORK, "old_" + os.path.basename(rel)))
-    if old:
-        df_old = pd.read_csv(old, dtype={"GID_1": str, "GID_2": str, "GID_3": str})
-        df_new = pd.concat([df_old, df_new], ignore_index=True)
-    df = df_new.reindex(columns=cols).drop_duplicates(subset=["GID_3", "MONTH"], keep="last")
-    for c in ("YEAR", "MONTH", "LIT_PIXELS"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    df["_k"] = df["GID_3"].map(lambda g: tuple(V.natural_sort_key(g)))
-    df = df.sort_values(["_k", "MONTH"]).drop(columns="_k")
+def _merge_national(df_new, rel, cols=None):
+    kind = 'day' if rel == V.DAY_CSV else 'night'
+    df = D.merge_valid(read_national(kind), df_new, ADMIN, kind, SOURCES)
     path = V.L(rel)
     V._write_csv(df, path)
-    if not V._rclone(["copyto", path, f"{V.REMOTE_BASE}/{rel}"]):
-        raise RuntimeError(f"Không ghi được {rel} lên Drive")
-    log.info(f"{rel}: {len(df):,} dòng, {df['GID_3'].nunique():,} xã (đã ghi lên Drive)")
+    upload_atomic(path, rel)
+    log.info(f'{rel}: {len(df):,} dòng, {df["gid_3"].nunique():,} xã')
     return df
 
 
 def day_csv():
-    paths = _download_csvs("day_csv_")
+    if PROGRESS is not None and PROGRESS['day_indices'].isin(D.TERMINAL).all():
+        return True
+    checkpoint('day_indices', list(CTX), None, 'running')
+    paths = _download_csvs('day_csv_')
     if not paths:
-        log.warning("Chưa có file day_csv_*.csv trong thư mục export.")
+        checkpoint('day_indices', list(CTX), None, 'pending', 'Đang chờ export CSV ngày')
         return False
-    df = pd.concat([pd.read_csv(p, dtype={"GID_3": str}) for p in paths], ignore_index=True)
-    adm = ADMIN[V.ADM_COLS]
-    unknown = set(df["GID_3"]) - set(adm["GID_3"])
-    if unknown:
-        log.warning(f"{len(unknown)} GID_3 trong CSV không có trong GADM, bỏ: {sorted(unknown)[:5]}")
-    df = df.merge(adm, on="GID_3", how="inner")          # = merge(lookup, df_s2, on="GID_3") của notebook
-    df["YEAR"] = V.YEAR
-    _merge_national(df, V.DAY_CSV, V.DAY_COLUMNS)
-    summary(f"- CSV ngày: gộp {len(paths)} file tỉnh, {df['GID_3'].nunique():,} xã")
+    df = pd.concat([pd.read_csv(p, dtype={'GID_3': str}) for p in paths], ignore_index=True)
+    df['YEAR'] = V.YEAR
+    if 'SOURCE_COUNT' in df:
+        for r in df.to_dict('records'):
+            if pd.notna(r.get('SOURCE_COUNT')):
+                SOURCES[r['GID_3'], int(r['MONTH']), 'day_indices'] = float(r['SOURCE_COUNT'])
+    _merge_national(df, V.DAY_CSV)
+    save_sources()
     return True
 
 
@@ -267,26 +358,33 @@ def night_records(row):
 
 
 def night_csv():
-    paths = _download_csvs("night_csv_")
+    D.require_day_complete(inventory())
+    if PROGRESS['night_indices'].isin(D.TERMINAL).all():
+        return True
+    checkpoint('night_indices', list(CTX), None, 'running')
+    paths = _download_csvs('night_csv_')
     if not paths:
-        log.warning("Chưa có file night_csv_*.csv trong thư mục export.")
+        checkpoint('night_indices', list(CTX), None, 'pending', 'Đang chờ export CSV đêm')
         return False
-    raw = pd.concat([pd.read_csv(p, dtype={"GID_3": str}) for p in paths], ignore_index=True)
-    n_cols = [c for c in raw.columns if c.startswith("n_")]
-    has_img = (raw[n_cols].fillna(0) > 0).any(axis=1)
-    cnt_cols = [c for c in raw.columns if c.startswith("avg_rad_count_")]
-    if has_img.any() and (not cnt_cols or raw.loc[has_img, cnt_cols].isna().all().all()):
-        raise RuntimeError("CSV đêm không có cột avg_rad_count_MM: tên khóa reduceRegion khác dự kiến, kiểm tra lại.")
+    raw = pd.concat([pd.read_csv(p, dtype={'GID_3': str}) for p in paths], ignore_index=True)
+    unknown = set(raw['GID_3']) - set(CTX)
+    if unknown:
+        raise ValueError(f'Export đêm có GID ngoài phạm vi: {sorted(unknown)[:10]}')
     frames = []
-    for row in raw.to_dict("records"):
-        if row["GID_3"] not in V.ADMIN_BY_GID:
-            continue
+    for row in raw.to_dict('records'):
+        for m in V.MONTHS:
+            count = _num(row.get(f'n_{m:02d}'))
+            if count is not None:
+                SOURCES[row['GID_3'], m, 'night_indices'] = count
+                SOURCES[row['GID_3'], m, 'night_image'] = count
+            if count and _num(row.get(f'avg_rad_count_{m:02d}')) is None:
+                raise RuntimeError(f'CSV đêm thiếu avg_rad_count: {row["GID_3"]}/{m}')
         d = night_records(row)
         if d is not None:
             frames.append(d)
-    df = pd.concat(frames, ignore_index=True)
-    _merge_national(df, V.NIGHT_CSV, V.NIGHT_COLUMNS)
-    summary(f"- CSV đêm: gộp {len(paths)} file tỉnh, {df['GID_3'].nunique():,} xã")
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=D.COLUMNS['night'])
+    _merge_national(df, V.NIGHT_CSV)
+    save_sources()
     return True
 
 
@@ -354,7 +452,7 @@ def group_files(listing, prefix):
         m = rx.match(f["Path"])
         if m:
             a, b = int(m.group(1) or 0), int(m.group(2) or 0)
-        tiles[(b, a) if os.environ.get("VNGIS_TILE_ORDER") == "colrow" else (a, b)] = f
+            tiles[(b, a) if os.environ.get("VNGIS_TILE_ORDER") == "colrow" else (a, b)] = f
     return tiles
 
 
@@ -467,23 +565,29 @@ def refresh_task_states():
 def process_group(prefix, kind, month, gids, listing, have, done_set):
     """Cắt 1 ảnh export (có thể nhiều ô) thành ảnh từng xã. Trả 'done' | 'waiting' | 'stopped'."""
     import rasterio
-    if prefix in done_set:
-        return "done"
+    if all(month in have[kind].get(g, set()) or SOURCES.get((g, month, kind + '_image')) == 0 for g in gids):
+        return 'done'
+    done_set.discard(prefix)
     if TASK_STATES.get(prefix) in ("FAILED", "CANCELLED", "CANCEL_REQUESTED"):
         log.error(f"[{prefix}] tác vụ export {TASK_STATES[prefix]}: gửi lại trong Colab (force=True).")
+        checkpoint(kind + '_image', gids, month, 'failed', f'Export {prefix}: {TASK_STATES[prefix]}')
         return "failed"
     tiles = group_files(listing, prefix)
-    if not export_ready(prefix, tiles):
+    if not tiles or not export_ready(prefix, tiles):
         return "waiting"
     geoms = load_geoms()
     d = B.D20 if kind == "day" else B.D500
     bands = V.DAY_BANDS_ALL if kind == "day" else ["avg_rad", "cf_cvg"]
     namer = V.day_name if kind == "day" else V.night_name
     dir_key = "rel_day_dir" if kind == "day" else "rel_night_dir"
-    already = {g for g in gids if month in have[kind].get(g, set())}
+    already = {g for g in gids if month in have[kind].get(g, set())
+               or SOURCES.get((g, month, kind + '_image')) == 0}
     todo = [g for g in gids if g not in already and g in geoms]
-    no_geom = [g for g in gids if g not in geoms]
-    cmp_gids = [g for g in gids if g in already and g in geoms][:COMPARE_N]
+    no_geom = [g for g in gids if g not in already and g not in geoms]
+    if no_geom:
+        checkpoint(kind + '_image', no_geom, month, 'failed', 'Không có ranh giới trong asset')
+        return 'failed'
+    cmp_gids = [g for g in gids if month in have[kind].get(g, set()) and g in geoms][:COMPARE_N]
     log.info(f"[{prefix}] {len(tiles)} ô | {len(gids):,} xã: {len(already):,} đã có, cần cắt {len(todo):,}"
              + (f", {len(no_geom)} xã không có ranh giới" if no_geom else "")
              + (f", so sánh {len(cmp_gids)} xã" if cmp_gids else ""))
@@ -500,9 +604,10 @@ def process_group(prefix, kind, month, gids, listing, have, done_set):
         fetch(f"{EXP}/{tiles[first]['Path']}", p0)
     with rasterio.open(p0) as src:
         tr = src.transform
+        untiled = len(keys) == 1 and _tile_re(prefix).match(tiles[first]['Path']).group(1) is None
+        single_shape = src.height, src.width
         if abs(tr.a - d) > 1e-9 * d * 1e3:
-            log.warning(f"[{prefix}] độ phân giải {tr.a} khác dự kiến {d}: dùng giá trị trong file")
-            d = tr.a
+            raise RuntimeError(f'[{prefix}] độ phân giải {tr.a} khác dự kiến {d}')
     X0, Y0 = tr.c - first[1] * d, tr.f + first[0] * d
     FD = B.FILE_DIMENSIONS
 
@@ -514,7 +619,13 @@ def process_group(prefix, kind, month, gids, listing, have, done_set):
 
     def tiles_of(w):
         r0, r1, c0, c1 = w
-        return {k for k in keys if k[0] < r1 and k[0] + FD > r0 and k[1] < c1 and k[1] + FD > c0}
+        if untiled:
+            if r0 < 0 or c0 < 0 or r1 > single_shape[0] or c1 > single_shape[1]:
+                return {(0, 0), (-1, -1)}  # incomplete coverage must fail, not produce fabricated zeros
+            return {(0, 0)}
+        # Require every tile crossing the commune bounding box, including absent files.
+        return {(r, c) for r in range((r0 // FD) * FD, r1, FD)
+                for c in range((c0 // FD) * FD, c1, FD)}
 
     pend = {}
     for g in todo + cmp_gids:
@@ -522,9 +633,10 @@ def process_group(prefix, kind, month, gids, listing, have, done_set):
         if w[1] <= w[0] or w[3] <= w[2]:
             w = (w[0], w[0] + 1, w[2], w[2] + 1)
         pend[g] = (w, tiles_of(w))
+    checkpoint(kind + '_image', todo, month, 'running')
     loaded = {}
     fails, n_ok, cmp_rows = [], 0, []
-    with ProcessPoolExecutor(max_workers=max(2, os.cpu_count() or 2)) as pool:
+    with ProcessPoolExecutor(max_workers=max(1, int(os.environ.get("VNGIS_CUT_WORKERS", "2")))) as pool:
         for k in keys:
             if V.STOP_EVENT.is_set():
                 return "stopped"
@@ -554,7 +666,16 @@ def process_group(prefix, kind, month, gids, listing, have, done_set):
                 elif job["cmp"]:
                     cmp_rows.append(_compare_one(g, month, kind, out, d))
                 else:
-                    n_ok += 1
+                    state, error = D.validate_image(out, kind)
+                    if state != 'done':
+                        fails.append((g, error))
+                        os.remove(out)
+                    else:
+                        rel = f"{CTX[g][dir_key]}/{namer(CTX[g], month)}"
+                        upload_atomic(out, rel)
+                        os.remove(out)
+                        have[kind].setdefault(g, set()).add(month)
+                        n_ok += 1
             if ready:
                 V.UPLOAD_NOW.set()
                 log.info(f"[{prefix}] ô {k}: cắt xong {n_ok:,}/{len(todo):,} xã | lỗi {len(fails)}")
@@ -565,11 +686,14 @@ def process_group(prefix, kind, month, gids, listing, have, done_set):
         V._write_csv(cdf, V.L(V.D_CONTROL, f"compare_{prefix}.csv"))
         log.info(f"[{prefix}] SO SÁNH với ảnh cũ: {cdf['verdict'].value_counts().to_dict()}")
         summary(f"- So sánh {prefix}: {cdf['verdict'].value_counts().to_dict()} (xem _control/compare_{prefix}.csv)")
+    for g in pend:
+        fails.append((g, 'Không đủ ô export phủ ranh giới xã'))
     if fails:
+        for g, error in fails:
+            checkpoint(kind + '_image', [g], month, 'failed', error)
         log.warning(f"[{prefix}] {len(fails)} xã lỗi: {fails[:5]}")
         V._write_csv(pd.DataFrame(fails, columns=["GID_3", "error"]), V.L(V.D_CONTROL, f"errors_{prefix}.csv"))
-    # Đợi đẩy hết ảnh của nhóm lên Drive rồi mới xóa file export
-    V.rclone_sync_once(final=True)
+    # Outputs are uploaded individually; shared Drive exports are retained.
     left = _local_tifs(kind)
     if left:
         log.warning(f"[{prefix}] còn {left} ảnh chưa đẩy lên Drive: giữ file export, lượt sau làm tiếp.")
@@ -584,6 +708,11 @@ def _check_tile(path, k, X0, Y0, d):
     import rasterio
     with rasterio.open(path) as src:
         tr = src.transform
+        kind = 'day' if abs(d - B.D20) < 1e-12 else 'night'
+        if src.crs is None or src.crs.to_epsg() != 4326 or src.count != (10 if kind == 'day' else 2):
+            raise RuntimeError('Ô export sai CRS hoặc số kênh')
+        if abs(tr.a - d) > d * 1e-6 or abs(tr.e + d) > d * 1e-6 or tr.b or tr.d:
+            raise RuntimeError('Ô export sai độ phân giải/lưới')
     ro, co = (Y0 - tr.f) / d, (tr.c - X0) / d
     if abs(ro - k[0]) > 1e-3 or abs(co - k[1]) > 1e-3:
         raise RuntimeError(f"Ô {os.path.basename(path)}: vị trí thật ({ro:.2f}, {co:.2f}) khác tên file {k}. "
@@ -621,6 +750,8 @@ def _local_tifs(kind):
 
 def _wait_space(size_bytes):
     need = size_bytes / 1e9 + V.MIN_FREE_GB
+    if free_gb() < need:
+        raise RuntimeError(f'Không đủ ổ trống để xử lý file {size_bytes} bytes; giảm phạm vi export hoặc tăng dung lượng')
     warned = False
     while free_gb() < need:
         V.UPLOAD_NOW.set()
@@ -633,21 +764,16 @@ def _wait_space(size_bytes):
 
 
 def _finish_group(prefix, tiles, done_set):
-    """Đánh dấu xong và xóa file export tạm trên Drive (giải phóng dung lượng)."""
+    """Keep shared exports for repair/resume; batch_done is informational only."""
     done_set.add(prefix)
-    path = V.L(V.D_CONTROL, "batch_done.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(sorted(done_set)) + "\n")
-    V._rclone(["copyto", path, f"{V.REMOTE_BASE}/{V.D_CONTROL}/batch_done.txt"])
-    if os.environ.get("VNGIS_KEEP_EXPORTS", "").lower() not in ("1", "true"):
-        lst = os.path.join(WORK, f"del_{prefix}.txt")
-        with open(lst, "w") as f:
-            f.write("\n".join(t["Path"] for t in tiles.values()) + "\n")
-        V._rclone(["delete", EXP, "--files-from", lst, "--drive-use-trash=false"])
+    path = V.L(V.D_CONTROL, 'batch_done.txt')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(sorted(done_set)) + '\n')
+    upload_atomic(path, '_control/batch_done.txt', backup=False)
     import shutil
-    shutil.rmtree(os.path.join(WORK, "tiles", prefix), ignore_errors=True)
-    log.info(f"[{prefix}] XONG, đã xóa file export tạm.")
-    return "done"
+    shutil.rmtree(os.path.join(WORK, 'tiles', prefix), ignore_errors=True)
+    log.info(f'[{prefix}] XONG, giữ nguyên file export trên Drive.')
+    return 'done'
 
 
 def load_done():
@@ -664,19 +790,23 @@ def run_images(kind):
     done_set = load_done()
     if kind == "day":
         plan = load_plan()
+        missing = set(CTX) - set(plan)
+        unknown = set(plan) - set(CTX)
+        if missing or unknown:
+            raise RuntimeError(f'Kế hoạch ảnh ngày không khớp địa giới: thiếu {len(missing)}, dư {len(unknown)} xã')
         groups = []
         for m in V.MONTHS:
             by_w = {}
             for g, rows in plan.items():
                 w = B.window_class(rows[m - 1])
-                if w is not None and g in V.ADMIN_BY_GID:
+                if w is not None and g in CTX:
                     by_w.setdefault(w, []).append(g)
             groups += [(B.day_img_prefix(m, w), m, gids) for w, gids in sorted(by_w.items())]
     else:
         all_g = list(ADMIN["GID_3"])
         groups = [(B.night_img_prefix(m), m, all_g) for m in V.MONTHS]
-    uploader = V.Uploader()
-    uploader.start()
+    if kind == 'night':
+        D.require_day_complete(inventory())
     try:
         while True:
             refresh_task_states()
@@ -701,45 +831,71 @@ def run_images(kind):
             if V.STOP_EVENT.wait(WAIT_POLL_SEC):
                 return 3
     finally:
-        uploader.stop_event.set()
-        uploader.join(timeout=120)
-        V.rclone_sync_once(final=True)
+        inventory()
 
 
 # ------------------------------------------------------------------------------------
 def main():
     global COMPARE_N
     ap = argparse.ArgumentParser()
-    ap.add_argument("step", choices=["inventory", "day-csv", "day-img", "night-csv", "night-img", "day", "night"])
-    ap.add_argument("--compare", type=int, default=0)
+    ap.add_argument('step', choices=['inventory', 'day-csv', 'day-img', 'night-csv', 'night-img', 'day', 'night'])
+    ap.add_argument('--compare', type=int, default=0)
     a = ap.parse_args()
     COMPARE_N = a.compare
-    setup()
     V.install_signal_handlers()
     if V.MAX_RUNTIME_SEC > 0:
-        t = threading.Timer(V.MAX_RUNTIME_SEC, V.request_stop, args=("deadline",))
+        t = threading.Timer(V.MAX_RUNTIME_SEC, V.request_stop, args=('deadline',))
         t.daemon = True
         t.start()
     code = 0
+    phase_field = None
     try:
-        if a.step in ("day-csv", "day"):
-            day_csv()
-        if a.step in ("night-csv", "night"):
-            night_csv()
-        if a.step in ("day-img", "day"):
-            code = run_images("day")
-        if a.step in ("night-img", "night"):
-            code = run_images("night")
-        if a.step in ("inventory", "day", "night") or code == 0:
-            inventory()
+        setup()
+        inventory()  # actual outputs before doing any work
+        if a.step.startswith('night'):
+            D.require_day_complete(PROGRESS)
+        if a.step in ('day-csv', 'day'):
+            phase_field = 'day_indices'
+            code = 0 if day_csv() else 3
+        if a.step in ('night-csv', 'night'):
+            phase_field = 'night_indices'
+            code = 0 if night_csv() else 3
+        if a.step in ('day-img', 'day'):
+            phase_field = 'day_image'
+            images_code = run_images('day')
+            code = 1 if 1 in (code, images_code) else max(code, images_code)
+        if a.step in ('night-img', 'night'):
+            phase_field = 'night_image'
+            images_code = run_images('night')
+            code = 1 if 1 in (code, images_code) else max(code, images_code)
+        table = inventory()
+        if a.step != 'inventory':
+            kind = 'day' if a.step.startswith('day') else 'night'
+            fields = [kind + '_image', kind + '_indices']
+            if a.step.endswith('-csv'):
+                fields = [kind + '_indices']
+            elif a.step.endswith('-img'):
+                fields = [kind + '_image']
+            if not table[fields].isin(D.TERMINAL).all().all():
+                code = 1 if code == 1 or table[fields].eq('failed').any().any() else 3
     except V.StopRequested:
         code = 3
     except Exception as exc:
-        log.error(f"LỖI: {type(exc).__name__}: {exc}")
+        log.error(f'LỖI: {type(exc).__name__}: {exc}')
         code = 1
-    log.info(f"Kết thúc, mã {code}")
+        if phase_field and PROGRESS is not None:
+            try:
+                checkpoint(phase_field, list(CTX), None, 'failed', f'{type(exc).__name__}: {exc}')
+            except Exception as write_error:
+                log.error(f'Không lưu được lỗi vào tiến độ: {write_error}')
+    log.info(f'Kết thúc, mã {code}')
+    try:
+        flush_logs()
+    except Exception as exc:
+        log.error(f'Không lưu được log lên Drive: {exc}')
+        code = 1 if code == 0 else code
     return code
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

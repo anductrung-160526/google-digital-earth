@@ -18,8 +18,12 @@ Earth Engine; việc kiểm tra "tháng có ảnh không" của Task 2/3.1 gom t
 tải song song.
 
 Chạy:
-    python vngis_2024.py               chạy pipeline
-    python vngis_2024.py --sync-only   đẩy nốt dữ liệu trên máy lên Drive
+    python vngis_2024.py inventory     kiểm kê dữ liệu đã có
+    python vngis_2024.py day           chạy batch phần ngày
+    python vngis_2024.py night         chạy batch phần đêm sau khi ngày đạt
+
+CLI hiện dùng process_exports.py và data_contract.py; các hàm khoa học dưới đây
+giữ nguyên để luồng batch dùng lại. Xem HUONG_DAN_BATCH.md.
 
 Mã thoát: 0 xong toàn bộ | 1 lỗi cấu hình hoặc preflight | 2 sự cố EE kéo dài | 3 hết giờ (nối lượt) | 130 dừng tay
 """
@@ -1335,6 +1339,11 @@ def read_dbf(path, encoding="utf-8"):
 
 
 def build_admin_table():
+    custom = os.environ.get('VNGIS_ADMIN_FILE')
+    if custom:
+        import data_contract as D
+        table = D.administrative_table(pd.read_csv(custom, dtype=str, keep_default_na=False))
+        return table.rename(columns={c: c.upper() for c in D.ADMIN_COLUMNS})
     idx_csv = os.path.join(CACHE_DIR, "gadm41_VNM_3_admin.csv")
     if os.path.isfile(idx_csv):
         return pd.read_csv(idx_csv, dtype=str, keep_default_na=False)
@@ -1694,9 +1703,8 @@ def main():
 
 
 if __name__ == "__main__" and os.environ.get("VNGIS_SKIP_MAIN") != "1":
-    if "--sync-only" in sys.argv:
-        setup_logging()
-        rclone_sync_once(final=True)
-        log.info("Đồng bộ nốt xong.")
-        sys.exit(0)
-    sys.exit(main())
+    # Keep the scientific functions importable; retire the mixed day/night CLI.
+    import process_exports
+    if len(sys.argv) == 1:
+        sys.argv.append('day')
+    sys.exit(process_exports.main())

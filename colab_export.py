@@ -23,6 +23,9 @@ import ee
 
 import vngis_2024 as V
 import batch_config as B
+import data_contract as D
+import pandas as pd
+from pathlib import Path
 
 YEAR = V.YEAR
 MONTHS = V.MONTHS
@@ -51,7 +54,14 @@ def init(project=B.PROJECT_ID, mount_drive=True):
     COMM = ee.FeatureCollection(B.ASSET_ID)
     V.CACHE_DIR = os.path.expanduser("~/vngis_cache")
     ADMIN = V.build_admin_table()
-    n_asset = COMM.size().getInfo()
+    D.administrative_table(ADMIN)
+    asset_gids = COMM.aggregate_array('GID_3').getInfo()
+    expected = set(ADMIN['GID_3'])
+    if len(asset_gids) != len(set(asset_gids)) or set(asset_gids) != expected:
+        missing, extra = expected - set(asset_gids), set(asset_gids) - expected
+        raise RuntimeError(f'Asset không khớp địa giới: thiếu {len(missing)}, dư {len(extra)}, '
+                           f'trùng {len(asset_gids)-len(set(asset_gids))}. Không tự bỏ xã.')
+    n_asset = len(asset_gids)
     print(f"Earth Engine: project {project} | asset {B.ASSET_ID}: {n_asset:,} xã | GADM: {len(ADMIN):,} xã, "
           f"{ADMIN['GID_1'].nunique()} tỉnh")
 
@@ -83,19 +93,77 @@ def _existing_tasks(refresh=False):
         for t in ee.data.getTaskList():
             d = t.get("description")
             st = t.get("state")
-            if d and (d not in m or st in ("READY", "RUNNING", "COMPLETED")):
-                m[d] = st
+            if d:
+                m.setdefault(d, st)  # newest task wins; an old success cannot hide a new failure
         _TASKS_CACHE.update(t=time.time(), map=m)
     return _TASKS_CACHE["map"]
 
 
 def _start(task, desc, force=False):
-    st = _existing_tasks().get(desc)
-    if st in ("READY", "RUNNING", "COMPLETED") and not force:
-        return f"bỏ qua ({st})"
+    st = _existing_tasks(refresh=True).get(desc)
+    if st in ('READY', 'RUNNING'):
+        return f'bỏ qua ({st})'  # force must not duplicate an active task
+    files = [p for p in Path(_out_dir()).glob(desc + '*') if p.is_file() and p.suffix in {'.tif', '.csv', '.geojson'}]
+    if st == 'COMPLETED' and files and not force and _export_files_valid(files, desc):
+        return 'bỏ qua (COMPLETED, còn export để tái sử dụng)'
     task.start()
-    _existing_tasks()[desc] = "READY"
-    return "đã gửi"
+    _existing_tasks()[desc] = 'READY'
+    return 'đã gửi'
+
+
+def _export_files_valid(files, desc):
+    for path in files:
+        try:
+            if path.suffix == '.tif':
+                kind = 'day' if desc.startswith('day_') else 'night'
+                if D.validate_image(path, kind)[0] != 'done':
+                    return False
+            elif path.suffix == '.geojson':
+                obj = json.loads(path.read_text())
+                if obj.get('type') != 'FeatureCollection' or not obj.get('features'):
+                    return False
+            else:
+                frame = pd.read_csv(path)
+                required = {'GID_3'}
+                if desc.startswith('day_csv_'):
+                    required.update(['MONTH'] + V.T1_FEATURES)
+                elif desc.startswith('night_csv_'):
+                    required.update(['area_ha'] + [f'n_{m:02d}' for m in MONTHS])
+                if frame.empty or not required.issubset(frame):
+                    return False
+        except (ValueError, OSError, pd.errors.ParserError):
+            return False
+    return True
+
+
+def inventory():
+    """Verify real destination files on mounted Drive before submitting any exports."""
+    drive_root = Path('/content/drive/MyDrive')
+    if not drive_root.is_dir():
+        raise RuntimeError('Cần mount Google Drive để kiểm kê VNGISDash_2024 trước khi gửi export')
+    root = drive_root / 'VNGISDash_2024'
+    root.mkdir(exist_ok=True)
+    plan_path = Path(_out_dir()) / B.PLAN_DAY
+    plan = json.loads(plan_path.read_text()) if plan_path.is_file() else {}
+    result = D.scan_local(root, ADMIN, plan)
+    print(result[D.FIELDS].apply(lambda c: c.value_counts()).fillna(0).astype(int))
+    return result
+
+
+def require_day_complete():
+    result = inventory()  # never trust a previous done marker alone
+    D.require_day_complete(result)
+    print('Phần ngày đã kiểm tra hợp lệ cho toàn bộ xã–tháng; cho phép phần đêm.')
+    return result
+
+
+def _needed(result, field, gids=None, month=None):
+    selected = ~result[field].isin(D.TERMINAL)
+    if gids is not None:
+        selected &= result['gid_3'].isin(gids)
+    if month is not None:
+        selected &= result['month'].eq(month)
+    return result.loc[selected, 'gid_3'].drop_duplicates().tolist()
 
 
 def status(prefix=None):
@@ -123,6 +191,7 @@ def status(prefix=None):
 # A. Ranh giới xã (để cắt ảnh trên GitHub)
 # ------------------------------------------------------------------------------------
 def submit_communes():
+    inventory()
     task = ee.batch.Export.table.toDrive(collection=COMM.select(["GID_3"]), description="communes_l3",
                                          folder=B.EXPORT_FOLDER, fileNamePrefix=B.COMMUNES_GEOJSON,
                                          fileFormat="GeoJSON")
@@ -167,6 +236,7 @@ def _plan_one(gids, depth=0):
 
 
 def compute_day_plan(workers=4, only=None):
+    inventory()
     path = os.path.join(_out_dir(), B.PLAN_DAY)
     plan = json.load(open(path, encoding="utf-8")) if os.path.isfile(path) else {}
     provs = provinces()
@@ -226,21 +296,26 @@ def _task1_fc(fc):
         tensor = V.add_indices(composite)
         stats = tensor.select(bands).reduceRegions(
             collection=fc, reducer=reducers, scale=50, tileScale=4, crs="EPSG:4326")
-        stats = stats.select(selected_cols).map(lambda f, m=m: f.set("MONTH", m))
-        per_month.append(ee.FeatureCollection(ee.Algorithms.If(raw_col.size().gt(0), stats,
-                                                               ee.FeatureCollection([]))))
+        stats = stats.select(selected_cols).map(lambda f, m=m, count=raw_col.size():
+                                                  f.set('MONTH', m).set('SOURCE_COUNT', count))
+        empty = fc.map(lambda f, m=m: ee.Feature(None, {'GID_3': f.get('GID_3'),
+                                                       'MONTH': m, 'SOURCE_COUNT': 0}))
+        per_month.append(ee.FeatureCollection(ee.Algorithms.If(raw_col.size().gt(0), stats, empty)))
     return ee.FeatureCollection(per_month).flatten()
 
 
 def submit_day_csv(only=None, force=False):
+    result = inventory()
     n = 0
     for g1, gids in provinces().items():
         if only and g1 not in only:
             continue
+        if not _needed(result, 'day_indices', gids):
+            continue
         desc = B.day_csv_prefix(g1)
         task = ee.batch.Export.table.toDrive(
             collection=_task1_fc(_prov_fc(gids)), description=desc, folder=B.EXPORT_FOLDER,
-            fileNamePrefix=desc, fileFormat="CSV", selectors=["GID_3", "MONTH"] + V.T1_FEATURES)
+            fileNamePrefix=desc, fileFormat="CSV", selectors=["GID_3", "MONTH", "SOURCE_COUNT"] + V.T1_FEATURES)
         r = _start(task, desc, force)
         n += r == "đã gửi"
         print(f"{desc}: {r}")
@@ -265,6 +340,7 @@ def _day_image(fc, month, window, region):
 
 
 def submit_day_images(months=None, force=False):
+    result = inventory()
     plan = load_plan()
     months = months or MONTHS
     for m in months:
@@ -274,6 +350,10 @@ def submit_day_images(months=None, force=False):
             if k is not None:
                 groups.setdefault(k, []).append(g)
         for w, gids in sorted(groups.items()):
+            missing = _needed(result, 'day_image', gids, m)
+            if not missing:
+                continue
+            # Retain the full group when exporting: a shared retained export repairs future gaps.
             desc = B.day_img_prefix(m, w)
             fc = _prov_fc(gids)
             region = (ee.Geometry.Rectangle(B.VN_BBOX, "EPSG:4326", False) if w == 0
@@ -296,10 +376,17 @@ def _viirs_col(m):
 
 
 def submit_night_images(months=None, force=False):
+    result = require_day_complete()
     region = ee.Geometry.Rectangle(B.VN_BBOX, "EPSG:4326", False)
     for m in months or MONTHS:
+        if not _needed(result, 'night_image', month=m):
+            continue
         desc = B.night_img_prefix(m)
-        img = _viirs_col(m).select(["avg_rad", "cf_cvg"]).mean().toDouble()
+        collection = _viirs_col(m)
+        if collection.size().getInfo() == 0:
+            print(f'{desc}: không có nguồn; bằng chứng n_MM sẽ được gộp từ CSV đêm')
+            continue
+        img = collection.select(["avg_rad", "cf_cvg"]).mean().toDouble()
         task = ee.batch.Export.image.toDrive(
             image=img, description=desc, folder=B.EXPORT_FOLDER, fileNamePrefix=desc, region=region,
             crs="EPSG:4326", crsTransform=B.T500, maxPixels=1e13, fileFormat="GeoTIFF")
@@ -350,11 +437,14 @@ def _task3_fc(fc):
 
 
 def submit_night_csv(only=None, force=False):
+    result = require_day_complete()
     sel = ["GID_3", "area_ha"] + [f"n_{m:02d}" for m in MONTHS] + \
           [f"{k}_{m:02d}" for m in MONTHS for k in NIGHT_KEYS]
     n = 0
     for g1, gids in provinces().items():
         if only and g1 not in only:
+            continue
+        if not _needed(result, 'night_indices', gids):
             continue
         desc = B.night_csv_prefix(g1)
         task = ee.batch.Export.table.toDrive(collection=_task3_fc(_prov_fc(gids)), description=desc,
@@ -376,7 +466,4 @@ def quick_check(gid1=None):
     gids = provs[gid1][:3]
     fc = _prov_fc(gids)
     t1 = _task1_fc(fc).limit(3).getInfo()["features"]
-    t3 = _task3_fc(fc.limit(1)).getInfo()["features"]
     print(f"{gid1}: Task1 mẫu: {[f['properties'] for f in t1][:1]}")
-    print(f"{gid1}: Task3.2 mẫu (tháng 01): "
-          f"{ {k: v for k, v in t3[0]['properties'].items() if k.endswith('_01') or k in ('GID_3', 'area_ha')} }")
