@@ -1,21 +1,21 @@
-# Ghi chú và điểm cần xác nhận
+# Ghi chú v6 đã chỉnh sửa
 
-## Chỗ pipeline làm khác so với bản prompt
+Nền khoa học và cách tải trực tiếp lấy từ `vngis-github-repo-v6.zip`. Schema, điều phối và pacing/retry được gộp trong `vngis_2024.py`; kiểm thử offline trong `verify_pilot.py --self-test`.
 
-1. **Trạng thái** lưu thành một file `.jsonl` mỗi lượt trong `_control/status/` (bản ghi sau cùng của mỗi xã có hiệu lực), thay cho 11.000 file `{GID_3}.json`. Kéo vài file nhỏ từ Drive nhanh hơn nhiều so với 11.000 file. Không cần lease vì workflow dùng `concurrency` nên mỗi lúc chỉ có một lượt chạy.
-2. **Đã bỏ** bảng chọn Tỉnh → Xã và Task 4 (đường, nhà xưởng, mặt nước, OSM) theo yêu cầu. Thí điểm tự lấy `pilot_n` xã, không cần nhập mã.
-3. **CSV** chỉ có 2 file gộp toàn quốc (`CSV/day_indices.csv`, `CSV/night_indices.csv`), không có CSV riêng từng xã. Thứ tự cột cố định theo danh sách cột trong notebook.
-4. **Ảnh ngày** mặc định giữ như bản 4 (10 kênh, số thực, nén không mất dữ liệu). Chế độ int16 và 6 kênh vẫn có, bật bằng biến môi trường.
+- JSONL v6 tiếp tục được đọc để khôi phục parts, bằng chứng nguồn mới và bộ đếm thử. Trạng thái cũ `done`, `ok`, `none`, `not_in_asset` không chứng minh file hợp lệ hoặc nguồn rỗng.
+- Tiến độ mới theo xã–tháng với bốn trường ngày/đêm độc lập và lỗi/thời điểm. CSV luôn đủ 12 dòng/GID, thông tin hành chính viết thường lấy từ GADM.
+- Chạy toàn bộ ngày, kiểm kê lại dữ liệu đã upload, rồi mới chạy đêm. Preflight/kế hoạch nguồn cũng tách giai đoạn.
+- Giữ đủ 10 kênh float ngày. Các hàm lưu int16 của ZIP còn trong nguồn tham chiếu v6 nhưng cấu hình chạy từ chối int16/6 kênh.
+- Task 1 lọc `CLOUDY_PIXEL_PERCENTAGE < 85`, fallback cảnh trong tháng, không nới biên. Task 2 không lọc cảnh, nới ±15/±30 ngày. CSV ngày không tính lại từ ảnh TIFF Task 2.
+- MA3 và tăng trưởng đêm vẫn tính trên các tháng có nguồn liên tiếp như v6; tháng trống chỉ được bổ sung vào CSV sau tính toán. Vì thế tăng trưởng sau một tháng thiếu nguồn vẫn so với dòng có nguồn trước đó.
+- Lưới chia ô chỉ được dùng khi preflight đạt. Không giảm độ phân giải để né quota.
+- Không có cấu hình bảo đảm hết 429. Chạy pilot với cấu hình thận trọng, xem log dịch vụ và tỷ lệ lỗi trước khi tăng tải.
+- Kiểm thử offline không xác nhận quota, quyền, nguồn ảnh, tính trùng lưới hoặc số liệu EE/Drive thật. Xem hướng dẫn pilot và đối chiếu notebook trong `HUONG_DAN.md`.
 
-## Điểm trong notebook nên hỏi lại người hướng dẫn (pipeline giữ nguyên, chưa sửa)
+## Dọn nhánh theo danh sách ZIP v6
 
-1. **Task 1 và Task 2 dùng hai ảnh tổng hợp khác nhau** cho cùng một tháng: Task 1 lọc cảnh `CLOUDY_PIXEL_PERCENTAGE < 85` và không nới biên; Task 2 không lọc cảnh và nới biên ±15, ±30 ngày. Vì vậy chỉ số trong CSV Task 1 không tính từ đúng ảnh tif Task 2.
-2. **Task 3.2 `TNL_MOM_GROWTH_PCT`** tính trên các dòng liên tiếp, nếu thiếu một tháng thì tăng trưởng sẽ so với tháng trước nữa.
+Nhánh chỉ giữ đúng 8 đường dẫn trong ZIP: vngis_2024.py, verify_pilot.py, requirements.txt, .gitignore, HUONG_DAN.md, DOI_CHIEU_NOTEBOOK.md, GHI_CHU.md và .github/workflows/vngis-2024.yml. Các file phụ, thư mục tests, workflow tests riêng, notebook và báo cáo riêng đã được gỡ sau khi gộp tính năng vào hai file Python. Workflow v6 vẫn chạy CI offline trên PR/main và kiểm thử trước xử lý dữ liệu. Kiểm thử gồm hash AST khoa học từ ZIP. Không xóa dữ liệu Drive hoặc chạy toàn quốc khi dọn repo.
 
-## Giới hạn và giả định
+## Sửa lỗi tóm tắt tiến độ
 
-- **Gom lệnh gọi phía máy chủ** dựa vào việc `ee.Algorithms.If` chỉ tính nhánh được chọn. Bước đối chiếu với notebook ở thí điểm (CSV lệch tối đa 1e-6) là bước xác nhận.
-
-- Chưa chạy được với Earth Engine và Drive thật từ môi trường của tôi. Các phần đã kiểm tra offline: đặt tên file, luồng trạng thái và chạy tiếp, ghép ô ảnh, nén không mất dữ liệu, tự chọn xã thí điểm, tải song song, lưu int16, dựng CSV toàn quốc, `verify_pilot.py`. Bước thí điểm là bước xác nhận thật.
-- Cách chia ô giả định Earth Engine đặt lưới pixel theo gốc tọa độ khi dùng `scale` + `crs`. Preflight kiểm tra giả định này trên dữ liệu thật; nếu không đạt, xã cần chia ô sẽ báo lỗi thay vì ghép sai. Ảnh ghép có thể dư vài hàng hoặc cột NoData ở viền so với ảnh tải nguyên, giá trị các pixel còn lại không đổi.
-- Mã xã lấy từ GADM 4.1; xã nào không có trong asset `communes_l3` được đánh dấu `not_in_asset` và bỏ qua.
+Tóm tắt dùng chung hàm chỉ đọc trong verify_pilot.py, chấp nhận GID_3/gid_3. Bảng v6 cũ theo xã được cảnh báo chưa có schema tháng, không bị coi hoàn tất. File thiếu/trống/sai cột được báo rõ; mã lỗi pipeline vẫn làm workflow thất bại. Thêm 7 kiểm thử hồi quy, gồm chạy đúng lệnh shell của workflow với bảng cũ sau pipeline mã 1. Artifact log và progress giúp chẩn đoán khi Drive không đồng bộ được. Lỗi gốc của pipeline cần log bước Chạy pipeline; không thể kết luận từ riêng KeyError ở bước tóm tắt.
