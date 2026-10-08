@@ -160,6 +160,11 @@ class ContractTests(unittest.TestCase):
 
 
 class ImageAndRunnerTests(unittest.TestCase):
+    def test_inventory_command_scans_drive_once(self):
+        with patch('sys.argv', ['process_exports.py', 'inventory']), patch.object(P, 'setup'), patch.object(P, 'inventory', return_value=complete_progress(admin())) as scan, patch.object(P, 'flush_logs'), patch.object(V, 'MAX_RUNTIME_SEC', 0):
+            self.assertEqual(P.main(), 0)
+            scan.assert_called_once_with()
+
     def test_verifier_checks_real_sample_and_rejects_empty_run(self):
         a = admin(('VNM.1.2_1',))
         gid = a.iloc[0].GID_3
@@ -414,6 +419,44 @@ class LocalDriveIntegrationTests(unittest.TestCase):
             D.require_day_complete(table)
         self.write_image(2)
         D.require_day_complete(P.inventory())
+
+    def test_interrupted_scan_saves_completed_checks_and_resumes(self):
+        with patch.object(V, 'check_stop', side_effect=[None, None, V.StopRequested()]), patch.dict(P.os.environ, {'VNGIS_INVENTORY_CHECKPOINT_EVERY': '250'}):
+            with self.assertRaises(V.StopRequested):
+                P.list_existing()
+        cache_path = self.target/'_control/validated_images.json'
+        self.assertEqual(len(json.loads(cache_path.read_text())), 2)
+        with patch.object(D, 'validate_image', wraps=D.validate_image) as check:
+            have = P.list_existing()
+            self.assertEqual(check.call_count, 10)
+        self.assertEqual(have['day'][self.gid], set(D.MONTHS))
+        self.assertEqual(len(json.loads(cache_path.read_text())), 12)
+
+    def test_partial_checkpoint_keeps_unvisited_cache_entries(self):
+        P.list_existing()
+        listing = self.listing('gdrive:VNGISDash_2024/Day', '-R', '--include', '*.tif')
+        first = self.target/'Day'/listing[0]['Path']
+        first.write_bytes(b'corrupt')
+        cache_path = self.target/'_control/validated_images.json'
+
+        def stop_after_checkpoint():
+            saved = json.loads(cache_path.read_text())
+            self.assertEqual(len(saved), 12)
+            self.assertEqual(saved['Day/'+listing[0]['Path']]['state'], 'failed')
+            raise V.StopRequested()
+
+        calls = iter([lambda: None, stop_after_checkpoint])
+        with patch.dict(P.os.environ, {'VNGIS_INVENTORY_CHECKPOINT_EVERY': '1'}), patch.object(V, 'check_stop', side_effect=lambda: next(calls)()):
+            with self.assertRaises(V.StopRequested):
+                P.list_existing()
+        with patch.object(D, 'validate_image', wraps=D.validate_image) as check:
+            P.list_existing()
+            check.assert_not_called()
+        self.write_image(int(D.IMAGE_RE.match(first.name)[3]))
+        with patch.object(D, 'validate_image', wraps=D.validate_image) as check:
+            have = P.list_existing()
+            self.assertEqual(check.call_count, 1)
+        self.assertEqual(have['day'][self.gid], set(D.MONTHS))
 
     def test_csv_missing_month_only_repaired_without_redownloading_valid_images(self):
         rows = records(self.a)

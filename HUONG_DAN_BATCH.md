@@ -23,6 +23,10 @@ Chạy workflow **VNGISDash 2024 batch**, chọn `step=inventory`. Nó:
 
 Dữ liệu hợp lệ được giữ nguyên. CSV có chỉ số mâu thuẫn ở cùng khóa, GID ngoài phạm vi hoặc năm/tháng sai sẽ được báo lỗi để xử lý rõ ràng, không âm thầm chọn/xóa bản ghi.
 
+`inventory` chỉ kiểm kê một lượt, không gửi export Earth Engine. Log `KIỂM KÊ` cho biết đang đọc bảng điều khiển, liệt kê Drive, tải ảnh hay đọc GeoTIFF; mỗi ảnh mới có dung lượng và thời gian kiểm tra. Lần đầu phải tải và đọc đầy đủ mọi ảnh chưa được xác minh, nên thời gian phụ thuộc tổng dung lượng và tốc độ Drive, không chỉ số xã. `VNGIS_RCLONE_TRANSFERS=16` không làm vòng kiểm tra từng ảnh này chạy song song.
+
+Cache `_control/validated_images.json` được lưu sau mỗi 250 ảnh mới hoặc khi đã qua 120 giây tại điểm kết thúc kiểm tra ảnh; có thể đổi ngưỡng số ảnh bằng `VNGIS_INVENTORY_CHECKPOINT_EVERY`. Khi bị ngắt có xử lý hoặc gặp lỗi, chương trình cố lưu những ảnh đã kiểm tra xong; khi bị dừng cưỡng bức, chỉ cache đã upload trước đó được giữ. Chạy lại `step=inventory` để tiếp tục. File hỏng vẫn có trạng thái `failed`, và chỉ được kiểm tra lại khi fingerprint thay đổi hoặc phiên bản kiểm tra thay đổi.
+
 ## 2. Giai đoạn ngày
 
 Mở `VNGIS_batch_colab.ipynb`, tải lên **4 file** `vngis_2024.py`, `batch_config.py`, `colab_export.py`, `data_contract.py`. Chạy:

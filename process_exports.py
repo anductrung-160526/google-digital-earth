@@ -173,8 +173,10 @@ _TIF_RE = re.compile(r"^(.+)_(day|night)_2024(\d\d)\.tif$")
 
 
 def list_existing():
-    """Validate actual Drive files; reuse only unchanged, previously decoded images."""
+    """Decode uncached Drive images, logging progress and persisting partial checks."""
     global IMAGE_CACHE
+    started = time.monotonic()
+    log.info('KIỂM KÊ: đọc cache kiểm tra ảnh trên Drive')
     path = fetch_optional(f'{V.REMOTE_BASE}/_control/validated_images.json',
                           os.path.join(WORK, 'validated_images.json'))
     cache = json.loads(Path(path).read_text(encoding='utf-8')) if path else {}
@@ -182,42 +184,88 @@ def list_existing():
     IMAGE_CACHE = {}
     next_cache = {}
     seen = set()
-    for kind in ['day', 'night']:
-        listing = rclone_json(f'{V.REMOTE_BASE}/{kind.title()}', '-R', '--hash', '--include', '*.tif')
-        for f in listing:
-            match = D.IMAGE_RE.match(os.path.basename(f['Path']))
-            if not match or match[2] != kind or match[1] not in SAFE2GID:
-                continue
-            V.check_stop()
-            gid, month = SAFE2GID[match[1]], int(match[3])
-            key = kind, gid, month
-            relative = f"{kind.title()}/{f['Path']}"
-            fingerprint = {'size': f.get('Size'), 'mtime': f.get('ModTime'),
-                           'hashes': f.get('Hashes', {}), 'version': D.VALIDATION_VERSION}
-            if key in seen:
-                IMAGE_CACHE[key] = 'failed', 'Có nhiều file cùng xã/tháng'
-                have[kind].get(gid, set()).discard(month)
-                continue
-            seen.add(key)
-            previous = cache.get(relative, {})
-            if previous.get('fingerprint') == fingerprint and previous.get('state') == 'done':
-                state, error = 'done', ''
-            else:
-                local = os.path.join(WORK, 'validate', os.path.basename(f['Path']))
-                _wait_space(f.get('Size', 0))
-                fetch(f'{V.REMOTE_BASE}/{relative}', local)
-                state, error = D.validate_image(local, kind)
-                os.remove(local)
-            IMAGE_CACHE[key] = state, error
-            next_cache[relative] = dict(fingerprint=fingerprint, state=state, error=error)
-            if state == 'done':
-                have[kind].setdefault(gid, set()).add(month)
-    local = V.L(V.D_CONTROL, 'validated_images.json')
-    with open(local + '.part', 'w', encoding='utf-8') as fh:
-        json.dump(next_cache, fh)
-    os.replace(local + '.part', local)
-    upload_atomic(local, '_control/validated_images.json', backup=False)
-    return have
+    checked, reused, downloaded, failures, downloaded_bytes = 0, 0, 0, 0, 0
+    dirty = 0
+    last_save = started
+    checkpoint_every = max(1, int(os.environ.get('VNGIS_INVENTORY_CHECKPOINT_EVERY', '250')))
+
+    def save_cache(partial=False):
+        nonlocal dirty, last_save
+        # Keep unvisited old entries after interruption; fingerprints are rechecked next run.
+        payload = {**cache, **next_cache} if partial else next_cache
+        local = V.L(V.D_CONTROL, 'validated_images.json')
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        with open(local + '.part', 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh)
+        os.replace(local + '.part', local)
+        upload_atomic(local, '_control/validated_images.json', backup=False)
+        dirty, last_save = 0, time.monotonic()
+        log.info(f'KIỂM KÊ: đã lưu cache; kiểm tra {checked:,} file, '
+                 f'tái sử dụng {reused:,}, tải/đọc {downloaded:,}, lỗi {failures:,}')
+
+    try:
+        for kind in ['day', 'night']:
+            log.info(f'KIỂM KÊ {kind}: đang liệt kê file trên Drive')
+            listing = rclone_json(f'{V.REMOTE_BASE}/{kind.title()}', '-R', '--hash', '--include', '*.tif')
+            log.info(f'KIỂM KÊ {kind}: tìm thấy {len(listing):,} file; bắt đầu đối chiếu cache')
+            for index, f in enumerate(listing, 1):
+                match = D.IMAGE_RE.match(os.path.basename(f['Path']))
+                if not match or match[2] != kind or match[1] not in SAFE2GID:
+                    continue
+                V.check_stop()
+                gid, month = SAFE2GID[match[1]], int(match[3])
+                key = kind, gid, month
+                relative = f"{kind.title()}/{f['Path']}"
+                fingerprint = {'size': f.get('Size'), 'mtime': f.get('ModTime'),
+                               'hashes': f.get('Hashes', {}), 'version': D.VALIDATION_VERSION}
+                if key in seen:
+                    IMAGE_CACHE[key] = 'failed', 'Có nhiều file cùng xã/tháng'
+                    have[kind].get(gid, set()).discard(month)
+                    failures += 1
+                    continue
+                seen.add(key)
+                previous = cache.get(relative, {})
+                if previous.get('fingerprint') == fingerprint and previous.get('state') in {'done', 'failed'}:
+                    state, error = previous['state'], previous.get('error', '')
+                    reused += 1
+                else:
+                    log.info(f'KIỂM KÊ {kind} {index:,}/{len(listing):,}: '
+                             f'tải {relative} ({f.get("Size", 0) / 1e6:.1f} MB)')
+                    local = os.path.join(WORK, 'validate', os.path.basename(f['Path']))
+                    _wait_space(f.get('Size', 0))
+                    file_started = time.monotonic()
+                    fetch(f'{V.REMOTE_BASE}/{relative}', local)
+                    log.info(f'KIỂM KÊ {kind} {index:,}/{len(listing):,}: đã tải, đang đọc GeoTIFF')
+                    try:
+                        state, error = D.validate_image(local, kind)
+                    finally:
+                        os.remove(local)
+                    downloaded += 1
+                    downloaded_bytes += f.get('Size', 0)
+                    dirty += 1
+                    log.info(f'KIỂM KÊ {kind} {index:,}/{len(listing):,}: {state}; '
+                             f'{time.monotonic() - file_started:.1f}s; '
+                             f'tổng đã tải {downloaded_bytes / 1e9:.2f} GB')
+                checked += 1
+                failures += state == 'failed'
+                IMAGE_CACHE[key] = state, error
+                next_cache[relative] = dict(fingerprint=fingerprint, state=state, error=error)
+                if state == 'done':
+                    have[kind].setdefault(gid, set()).add(month)
+                if dirty >= checkpoint_every or (dirty and time.monotonic() - last_save >= 120):
+                    save_cache(partial=True)
+                elif checked % checkpoint_every == 0:
+                    log.info(f'KIỂM KÊ: đối chiếu {checked:,} file, tái sử dụng {reused:,} kết quả')
+        save_cache()
+        log.info(f'KIỂM KÊ ảnh hoàn tất: {checked:,} file trong {time.monotonic() - started:.1f}s')
+        return have
+    finally:
+        if dirty:
+            # Preserve completed checks even if a later download or deadline fails.
+            try:
+                save_cache(partial=True)
+            except Exception as exc:
+                log.error(f'Không lưu được cache kiểm kê giữa chừng: {exc}')
 
 
 def read_national(kind):
@@ -228,10 +276,13 @@ def read_national(kind):
 
 def inventory():
     global PROGRESS, SOURCES
+    log.info('KIỂM KÊ: đọc tiến độ cũ từ Drive')
     previous = fetch_optional(f'{V.REMOTE_BASE}/_control/progress.csv', os.path.join(WORK, 'previous.csv'))
     prior = pd.read_csv(previous) if previous else None
+    log.info('KIỂM KÊ: đọc bảng bằng chứng nguồn từ Drive')
     source = fetch_optional(f'{V.REMOTE_BASE}/_control/source_counts.csv', os.path.join(WORK, 'sources.csv'))
     SOURCES = D.read_sources(source) if source else {}
+    log.info('KIỂM KÊ: đọc kế hoạch ảnh ngày')
     try:
         plan = load_plan()
     except FileNotFoundError:
@@ -240,6 +291,7 @@ def inventory():
     if SOURCES != (D.read_sources(source) if source else {}):
         save_sources()
     list_existing()
+    log.info('KIỂM KÊ: đọc và kiểm tra hai CSV chỉ số')
     frames = {kind: read_national(kind) for kind in ['day', 'night']}
     for kind, frame in frames.items():
         normalized = D.normalize(frame, ADMIN, kind)
@@ -249,6 +301,7 @@ def inventory():
             V._write_csv(normalized, path)
             upload_atomic(path, 'CSV/' + kind + '_indices.csv')
         frames[kind] = normalized
+    log.info('KIỂM KÊ: dựng tiến độ theo xã–tháng')
     PROGRESS = D.progress(ADMIN, frames, IMAGE_CACHE, SOURCES, prior)
     path = V.L(V.D_CONTROL, 'progress.csv')
     V._write_csv(PROGRESS, path)
@@ -851,7 +904,7 @@ def main():
     phase_field = None
     try:
         setup()
-        inventory()  # actual outputs before doing any work
+        table = inventory()  # actual outputs before doing any work
         if a.step.startswith('night'):
             D.require_day_complete(PROGRESS)
         if a.step in ('day-csv', 'day'):
@@ -868,8 +921,8 @@ def main():
             phase_field = 'night_image'
             images_code = run_images('night')
             code = 1 if 1 in (code, images_code) else max(code, images_code)
-        table = inventory()
         if a.step != 'inventory':
+            table = inventory()
             kind = 'day' if a.step.startswith('day') else 'night'
             fields = [kind + '_image', kind + '_indices']
             if a.step.endswith('-csv'):
